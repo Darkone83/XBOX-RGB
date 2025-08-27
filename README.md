@@ -1,6 +1,6 @@
 # XBOX RGB (ESP32-S3)
 
-Tiny ESP32-S3 project that drives up to **6 WS2812/NeoPixel channels** for original Xbox front-panel lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
+Tiny ESP32-S3 project that drives up to **6 WS2812/NeoPixel channels** for original Xbox RGB lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
 
 - **CH1–CH4**: Main decorative LEDs (up to **50 pixels per channel**).  
 - **CH5**: CPU temperature bar (up to **10 pixels**).  
