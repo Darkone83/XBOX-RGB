@@ -1,6 +1,6 @@
-# XBOX RGB (ESP32-S3)
+# XBOX RGB 
 
-Tiny ESP32-S3 project that drives up to **6 WS2812/NeoPixel channels** for original Xbox RGB lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
+A custom RGB controller that drives up to **6 WS2812/NeoPixel channels** for original Xbox RGB lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
 
 - **CH1–CH4**: Main decorative LEDs (up to **50 pixels per channel**).  
 - **CH5**: CPU temperature bar (up to **10 pixels**).  
@@ -54,20 +54,17 @@ Designed around **ESP32-S3-Zero** (or similar ESP32-S3 boards).
 
 - **CH1** → `IO1` (Front)  
 - **CH2** → `IO2` (Left)  
-- **CH3** → `IO4` (Rear)  
-- **CH4** → `IO5` (Right)  
-- **CH5** → `IO6` (CPU bar)  
-- **CH6** → `IO7` (Fan bar)
+- **CH3** → `IO3` (Rear)  
+- **CH4** → `IO4` (Right)  
+- **CH5** → `IO5` (CPU bar)  
+- **CH6** → `IO6` (Fan bar)
 
 **SMBus (Xbox SMC I²C):**
 
-- **SDA** → `IO8`  
-- **SCL** → `IO9`
+- **SDA** → `IO7`  
+- **SCL** → `IO8`
 
 > If a strip is reversed physically, flip that channel via the `REVERSE[]` flags in `RGBCtrl.cpp`.
-
-**Power:**  
-WS2812 LEDs need **5 V** and real current (up to ~60 mA per LED at full white). Use a stable 5 V supply, **share ground** with the ESP32, add a **330 Ω** data resistor per strip and a **1000 µF** cap across 5 V/GND near the LEDs.
 
 ---
 
