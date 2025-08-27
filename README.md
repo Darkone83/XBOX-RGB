@@ -1,2 +1,108 @@
-# XBOX-RGB
-An exp32 based RGB controller for the original xbox
+# XBOX RGB (ESP32-S3)
+
+Tiny ESP32-S3 project that drives up to **6 WS2812/NeoPixel channels** for original Xbox front-panel lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
+
+- **CH1–CH4**: Main decorative LEDs (up to **50 pixels per channel**).  
+- **CH5**: CPU temperature bar (up to **10 pixels**).  
+- **CH6**: Fan speed bar (up to **10 pixels**).  
+
+The web UI previews changes live and saves them to flash (NVS).
+
+---
+
+## Features
+
+- ✨ **12 animation modes** (see below) with live preview
+- 🔆 Global **brightness** (1–255)
+- ⚙️ Per-mode controls: **Speed**, **Intensity**, **Width/Gap**, **Color A / Color B**
+- 🧭 **Sane orientation & sync**: effects start at **CH1 (Front)** and flow clockwise **CH1→CH2→CH3→CH4**; all “phase” effects are synchronized
+- 💾 **Persistent settings** in NVS (counts, mode, colors, brightness, toggles…)
+- 📶 **Wi-Fi portal** (AP SSID `XBOX RGB Setup`) with a sticky SSID picker
+- 🌐 **Web UI** at `/config`
+- 🔁 **OTA updates** at `/ota`
+- 🧪 **SMBus (Xbox SMC) telemetry** (optional, on CH5/CH6)
+  - **CPU temperature** bar (green→yellow→red, max 75 °C)
+  - **Fan percentage** bar (blue→yellow→orange)
+
+---
+
+## Animation Modes
+
+1. **Solid**  
+2. **Breathe** *(synced across all channels)*  
+3. **Color Wipe**  
+4. **Larson Scanner (Cylon)**  
+5. **Rainbow** *(synced progression around the ring)*  
+6. **Theater Chase**  
+7. **Twinkle**  
+8. **Comet**  
+9. **Meteor** *(Color A→Color B trail)*  
+10. **Clock Spin**  
+11. **Plasma**  
+12. **Fire / Flicker**
+
+> The UI only shows controls that matter for the selected mode.  
+> Example: *Meteor* uses **Color A** and **Color B**; *Breathe* ignores **width**.
+
+---
+
+## Hardware
+
+Designed around **ESP32-S3-Zero** (or similar ESP32-S3 boards).
+
+**Typical channel mapping** (adjust in code if needed):
+
+- **CH1** → `IO1` (Front)  
+- **CH2** → `IO2` (Left)  
+- **CH3** → `IO4` (Rear)  
+- **CH4** → `IO5` (Right)  
+- **CH5** → `IO6` (CPU bar)  
+- **CH6** → `IO7` (Fan bar)
+
+**SMBus (Xbox SMC I²C):**
+
+- **SDA** → `IO8`  
+- **SCL** → `IO9`
+
+> If a strip is reversed physically, flip that channel via the `REVERSE[]` flags in `RGBCtrl.cpp`.
+
+**Power:**  
+WS2812 LEDs need **5 V** and real current (up to ~60 mA per LED at full white). Use a stable 5 V supply, **share ground** with the ESP32, add a **330 Ω** data resistor per strip and a **1000 µF** cap across 5 V/GND near the LEDs.
+
+---
+
+## Web UI
+
+- Visit **`/config`** on the device to control animations.  
+- **Live preview** applies instantly; **Save** writes to flash.  
+- SMBus toggles (Enable CPU / Enable Fan) live under “Xbox SMBus LEDs”.
+
+**Captive Portal:**  
+On first boot (or after forgetting Wi-Fi) connect to AP **`XBOX RGB Setup`** → it redirects to the setup page. The SSID picker is refreshed and “sticky” to reduce scan failures.
+
+**OTA:**  
+Open **`/ota`**, pick your compiled `.bin`, upload, wait for reboot.
+
+---
+
+## Building / Compiling
+
+### Prerequisites
+
+- **Arduino IDE 2.x** (or PlatformIO)
+- **ESP32 board support** (Arduino-ESP32 **3.x**)
+- Libraries:
+  - **ESP Async WebServer** (me-no-dev)
+  - **AsyncTCP** (ESP32)
+  - **Adafruit NeoPixel**
+  - **ArduinoJson**
+  - Core: **Preferences**, **DNSServer**, **Update**
+
+> Ensure AsyncTCP matches the ESP32 core version (latest works with Arduino-ESP32 3.x).
+
+### Board Settings (typical)
+
+- **Board:** `ESP32S3 Dev Module` (or your S3 variant)  
+- **USB CDC On Boot:** Enabled  
+- **PSRAM:** Optional  
+- **Partition Scheme:** Default (4 MB with spiffs is fine)
