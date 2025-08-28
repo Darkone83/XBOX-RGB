@@ -1,4 +1,13 @@
+<div align=center>
+  <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/DC%20logo.png">
+</div>
+
 # XBOX RGB 
+
+<div align=center>
+  <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Front.png" width=400><img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Back.png" width=400>
+</div>
+
 
 A custom RGB controller that drives up to **6 WS2812/NeoPixel channels** for original Xbox RGB lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
 
@@ -47,6 +56,18 @@ The web UI previews changes live and saves them to flash (NVS).
 ---
 
 ## Hardware
+
+## Purchasing sources
+
+ESP32 S3 Zero: <a href="https://www.amazon.com/dp/B0D1CB3PBW?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_1">Amazon</a>, <a href="https://www.aliexpress.us/item/3256808233319699.html?spm=a2g0o.order_list.order_list_main.11.51cb1802dPO6b4&gatewayAdapt=glo2usa">Aliexpress</a>
+
+JST Wire kit: <a href="https://www.amazon.com/dp/B0D5X6BY5Z?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_1">Amazon</a>
+
+JST Socket kit: <a href="amazon.com/dp/B0CQ28CCQG?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_2">Amazon</a>
+
+Additional wire may be needed to connect your harness to your LED strips.
+
+## Hardware layout
 
 Designed around **ESP32-S3-Zero** (or similar ESP32-S3 boards).
 
