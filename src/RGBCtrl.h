@@ -30,4 +30,17 @@ void forceLoad();   // reload config from NVS, re-applies
 bool smbusCpuEnabled();
 bool smbusFanEnabled();
 
+// ----- JSON control helpers (for UDP or any external controller) -----
+// Apply a JSON config (same schema as the Web UI) without saving to NVS.
+bool applyJsonPreview(const String& json);
+
+// Apply a JSON config and save it to NVS.
+bool applyJsonSave(const String& json);
+
+// Get the current config as JSON (same schema Web UI returns).
+String getConfigJson();
+
+// Restore factory defaults, apply, and render immediately.
+void resetToDefaults();
+
 } // namespace RGBCtrl

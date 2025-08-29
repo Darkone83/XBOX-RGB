@@ -2,6 +2,7 @@
 #include "led_stat.h"
 #include "RGBCtrl.h"
 #include "RGBsmbus.h"
+#include "RGBudp.h"
 #include  <ESPmDNS.h>
 
 extern AsyncWebServer server;
@@ -17,6 +18,7 @@ void setup() {
     /*sda=*/8,    // XSDA
     /*scl=*/9     // XSCL
   }, 10, 10);
+  RGBCtrlUDP::begin(7777 /*port*/, nullptr /*or "my_psk"*/);
 }
 
 
@@ -25,6 +27,7 @@ void loop() {
   WiFiMgr::loop();
   RGBCtrl::loop();
   RGBsmbus::loop();
+  RGBCtrlUDP::loop();
 
   static bool mdnsStarted = false;
   const bool connected = WiFiMgr::isConnected();

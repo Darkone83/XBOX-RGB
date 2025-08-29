@@ -3,25 +3,25 @@
 #include <Adafruit_NeoPixel.h>
 #include <ESPAsyncWebServer.h>
 
+// Read the toggles saved by RGBCtrl's Web UI (no extra REST needed)
+namespace RGBCtrl {
+  bool smbusCpuEnabled();
+  bool smbusFanEnabled();
+}
+
 // ========================= USER CONFIG =========================
-// LED pixel format for CH5/CH6 bars:
 #ifndef RGBSMBUS_PIXEL_TYPE
 #define RGBSMBUS_PIXEL_TYPE (NEO_GRB + NEO_KHZ800)
 #endif
 
-// Global brightness for CH5/CH6 bars (0..255)
-static const uint8_t  BRIGHTNESS       = 160;
-
-// How often to poll the Xbox SMBus (ms)  —— per request: 10 seconds
-static const uint32_t POLL_INTERVAL_MS = 10000;
-
-// Smoothing factor for readings (0..1). Lower = slower response.
-static const float    SMOOTH_ALPHA     = 0.35f;
+static const uint8_t  BRIGHTNESS       = 160;    // CH5/CH6 bar brightness
+static const uint32_t POLL_INTERVAL_MS = 10000;  // poll every 10s
+static const float    SMOOTH_ALPHA     = 0.35f;  // EMA smoothing
 
 // CPU °C thresholds
-static const float CPU_COOL_MAX_C = 45.0f;
-static const float CPU_WARM_MAX_C = 65.0f;
-static const float CPU_MAX_C      = 75.0f;
+static const float CPU_COOL_MAX_C = 25.0f;
+static const float CPU_WARM_MAX_C = 45.0f;
+static const float CPU_MAX_C      = 65.0f;
 
 // Fan % thresholds
 static const float FAN_SLOW_MAX   = 33.0f;
@@ -40,47 +40,39 @@ static const uint32_t FAN_FAST_COLOR = 0xFF7A00; // orange
 static const uint32_t FAIL_COLOR     = 0x400000; // dim red on error
 // ===============================================================
 
-
 // ======== Xbox SMC SMBus (I²C) details =========
-// NOTE: Wire uses 7-bit addresses. These match the Xbox SMC/encoders.
 static const uint8_t SMC_ADDRESS   = 0x10; // SMC PIC (7-bit)
 static const uint8_t REG_CPUTEMP   = 0x09; // °C
-static const uint8_t REG_FANSPEED  = 0x10; // raw 0..50 -> ×2 => percent
+static const uint8_t REG_FANSPEED  = 0x10; // 0..50 -> ×2 => %  (some FW returns 0..100)
 
-// Video encoders (7-bit):
-//  - Conexant ~0x45 (8-bit 0x8A/0x8B)
-//  - Focus    ~0x6A (8-bit 0xD4/0xD5)
-//  - Xcalibur ~0x70 (8-bit 0xE0/0xE1)
+// Video encoders (7-bit) — probe to identify board family
 static const uint8_t I2C_XCALIBUR  = 0x70;
-// ==============================================
-
+// ===============================================
 
 namespace RGBsmbus {
 
-// Defaults: SDA/SCL 0/0 here are placeholders; call begin(...) with real pins.
-// ch5/ch6 default to 7/6 for compatibility with your earlier mapping.
 static RGBsmbusPins PINS{0,0,7,6};
 
-static uint8_t CH5_COUNT = 10;
-static uint8_t CH6_COUNT = 10;
+static uint8_t CH5_COUNT = 5;
+static uint8_t CH6_COUNT = 5;
 
 // CH5 = CPU bar, CH6 = FAN bar
-static Adafruit_NeoPixel cpuStrip(10, 1, RGBSMBUS_PIXEL_TYPE);
-static Adafruit_NeoPixel fanStrip(10, 2, RGBSMBUS_PIXEL_TYPE);
+static Adafruit_NeoPixel cpuStrip(5, 1, RGBSMBUS_PIXEL_TYPE);
+static Adafruit_NeoPixel fanStrip(5, 2, RGBSMBUS_PIXEL_TYPE);
 
 static uint32_t lastPoll = 0;
 static float smoothedCpu = 0.0f;
 static float smoothedFan = 0.0f;
 
+// We still keep local copies, but we now *mirror* RGBCtrl flags each poll
 static bool gEnableCPU   = true;
 static bool gEnableFAN   = true;
 
-static bool gIsXcalibur  = false;   // detected at runtime
+static bool gIsXcalibur  = false;
 
-// Track last brightness applied (to mirror RGBCtrl behavior)
+// track last applied brightness
 static uint8_t lastAppliedBrightnessCpu = 0xFF;
 static uint8_t lastAppliedBrightnessFan = 0xFF;
-
 
 // ---------- helpers ----------
 static inline float clampf(float v, float lo, float hi) {
@@ -127,67 +119,101 @@ static uint8_t barLen(float val, float maxVal, uint8_t n) {
   return (uint8_t)lit;
 }
 static void drawBar(Adafruit_NeoPixel& strip,
-                    uint8_t& lastBriRef,   // reference to last brightness cache
+                    uint8_t& lastBriRef,
                     uint8_t nleds,
                     uint8_t lit,
                     uint32_t rgb24) {
   const uint8_t r=(rgb24>>16)&0xFF, g=(rgb24>>8)&0xFF, b=rgb24&0xFF;
 
-  // Update pixels
   for (uint8_t i=0;i<nleds;++i)
     strip.setPixelColor(i, (i<lit)?r:0, (i<lit)?g:0, (i<lit)?b:0);
 
-  // Apply brightness if changed (like RGBCtrl)
   if (lastBriRef != BRIGHTNESS) {
     strip.setBrightness(BRIGHTNESS);
     lastBriRef = BRIGHTNESS;
   }
-
-  // One show() per bar update (consistent with RGBCtrl’s cadence)
   strip.show();
 }
 
-
-// ---------- SMBus ----------
-static int readSMBusByte(uint8_t addr7, uint8_t reg, uint8_t& value) {
+// ---------- SMBus (robust reads) ----------
+static bool readTryRepeatedStart(uint8_t addr7, uint8_t reg, uint8_t& value) {
   Wire.beginTransmission(addr7);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return -1;
-  Wire.requestFrom(addr7, (uint8_t)1);
-  if (Wire.available()) { value = Wire.read(); return 0; }
-  return -1;
+  if (Wire.endTransmission(false) != 0) return false; // no STOP
+  if (Wire.requestFrom((int)addr7, 1, (int)true) != 1) return false;
+  value = Wire.read();
+  return true;
+}
+static bool readTryStopThenRead(uint8_t addr7, uint8_t reg, uint8_t& value) {
+  Wire.beginTransmission(addr7);
+  Wire.write(reg);
+  if (Wire.endTransmission(true) != 0) return false;  // with STOP
+  delayMicroseconds(150);
+  if (Wire.requestFrom((int)addr7, 1, (int)true) != 1) return false;
+  value = Wire.read();
+  return true;
+}
+static bool readSMBusByteRobust(uint8_t addr7, uint8_t reg, uint8_t& value) {
+  for (uint8_t attempt=0; attempt<3; ++attempt) {
+    if (readTryRepeatedStart(addr7, reg, value)) return true;
+    if (readTryStopThenRead(addr7, reg, value))  return true;
+    delay(2);
+  }
+  return false;
+}
+static bool readMedianByte(uint8_t addr7, uint8_t reg, uint8_t& out) {
+  uint8_t got = 0, a=0, b=0, c=0;
+  for (uint8_t i=0; i<3; ++i) {
+    uint8_t v=0;
+    if (readSMBusByteRobust(addr7, reg, v)) {
+      if (got==0) a=v; else if (got==1) b=v; else c=v;
+      ++got;
+      delayMicroseconds(200);
+    }
+  }
+  if (got < 2) return false;
+  if (got == 2) { out = (uint8_t)((a + b) / 2); return true; }
+  uint8_t lo = a<b ? a : b;  uint8_t hi = a>b ? a : b;
+  out = (c<lo) ? lo : (c>hi ? hi : c);
+  return true;
+}
+static bool readCpuCelsius(uint8_t& outC) {
+  uint8_t v=0;
+  if (!readMedianByte(SMC_ADDRESS, REG_CPUTEMP, v)) return false;
+  if (v > 100) return false;     // plausibility guard (0..100 °C)
+  outC = v;
+  return true;
+}
+static bool readFanPercent(uint8_t& outPct) {
+  uint8_t v=0;
+  if (!readMedianByte(SMC_ADDRESS, REG_FANSPEED, v)) return false;
+  uint16_t pct = (v <= 50) ? (uint16_t)v * 2u : (uint16_t)v; // 0..50 → %
+  if (pct > 100) pct = 100;
+  outPct = (uint8_t)pct;
+  return true;
 }
 
-static bool pollSelective(bool wantCPU, bool wantFAN, int& outCpu, int& outFan) {
-  bool ok = true;
-  outCpu = -1; outFan = -1;
-  uint8_t v;
-
-  if (wantCPU) {
-    if (readSMBusByte(SMC_ADDRESS, REG_CPUTEMP, v)==0 && v < 120) outCpu = (int)v;
-    else ok = false;
-  }
-  if (wantFAN) {
-    if (readSMBusByte(SMC_ADDRESS, REG_FANSPEED, v)==0 && v <= 50) outFan = int(v)*2; // 0..100%
-    else ok = false;
-  }
-  return ok;
-}
-
-// Lightweight presence probe (7-bit I2C address)
+// Probe for encoder (optional)
 static bool probeI2C(uint8_t addr7) {
   Wire.beginTransmission(addr7);
   uint8_t err = Wire.endTransmission();
   return (err == 0);
 }
-
 static void detectBoard() {
-  // Detect Xcalibur encoder; safe no-op if absent.
   gIsXcalibur = probeI2C(I2C_XCALIBUR);
-  // (If you need different scaling/regs for 1.6 in the future,
-  //  use gIsXcalibur to branch. Current SMC regs work as-is.)
 }
 
+// ---------- internal ----------
+static void applyEnableFlags(bool wantCPU, bool wantFAN) {
+  if (gEnableCPU != wantCPU) {
+    gEnableCPU = wantCPU;
+    if (!gEnableCPU && CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+  }
+  if (gEnableFAN != wantFAN) {
+    gEnableFAN = wantFAN;
+    if (!gEnableFAN && CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+  }
+}
 
 // ---------- public ----------
 void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
@@ -195,7 +221,6 @@ void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
   CH5_COUNT = ch5Count>10?10:ch5Count;
   CH6_COUNT = ch6Count>10?10:ch6Count;
 
-  // Bind LED channels to the right GPIOs and init (RGBCtrl style)
   cpuStrip.updateLength(CH5_COUNT); cpuStrip.setPin(PINS.ch5);
   fanStrip.updateLength(CH6_COUNT); fanStrip.setPin(PINS.ch6);
 
@@ -205,31 +230,54 @@ void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
   lastAppliedBrightnessCpu = BRIGHTNESS;
   lastAppliedBrightnessFan = BRIGHTNESS;
 
-  // Bring up I2C and auto-detect Xcalibur
   Wire.begin(PINS.sda, PINS.scl);
+  Wire.setClock(72000);     // <<<<<< requested 72 kHz
+#ifdef ARDUINO_ARCH_ESP32
+  Wire.setTimeOut(20);      // keep bus stalls short to avoid UI hiccups
+#endif
+
   detectBoard();
 
   lastPoll = 0;
   smoothedCpu = 0.f; smoothedFan = 0.f;
+
+  // Initialize local flags from RGBCtrl's saved state
+  applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
 }
 
 static void updateOnce() {
-  // If both disabled, skip the bus entirely
-  if (!gEnableCPU && !gEnableFAN) return;
+  // Mirror UI flags on every cycle (cheap & keeps in sync)
+  applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
 
-  int rawCpu=-1, rawFan=-1;
-  bool ok = pollSelective(gEnableCPU, gEnableFAN, rawCpu, rawFan);
+  // If both disabled, skip the bus entirely and ensure LEDs are off
+  if (!gEnableCPU && !gEnableFAN) {
+    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    return;
+  }
+
+  bool ok = true;
+  int cpuC = -1;
+  int fanP = -1;
+
+  if (gEnableCPU) {
+    uint8_t v=0;
+    if (readCpuCelsius(v)) cpuC = (int)v; else ok = false;
+  }
+  if (gEnableFAN) {
+    uint8_t v=0;
+    if (readFanPercent(v)) fanP = (int)v; else ok = false;
+  }
 
   if (ok) {
     if (gEnableCPU) {
-      if (rawCpu >= 0) {
-        smoothedCpu = SMOOTH_ALPHA * float(rawCpu) + (1.f-SMOOTH_ALPHA)*smoothedCpu;
+      if (cpuC >= 0) {
+        smoothedCpu = SMOOTH_ALPHA * float(cpuC) + (1.f-SMOOTH_ALPHA)*smoothedCpu;
         drawBar(cpuStrip, lastAppliedBrightnessCpu,
                 CH5_COUNT,
                 barLen(smoothedCpu, CPU_MAX_C, CH5_COUNT),
                 colorForCpu(smoothedCpu));
       } else {
-        // reading disabled or invalid—turn off if not enabled
         drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
       }
     } else {
@@ -237,8 +285,8 @@ static void updateOnce() {
     }
 
     if (gEnableFAN) {
-      if (rawFan >= 0) {
-        smoothedFan = SMOOTH_ALPHA * float(rawFan) + (1.f-SMOOTH_ALPHA)*smoothedFan;
+      if (fanP >= 0) {
+        smoothedFan = SMOOTH_ALPHA * float(fanP) + (1.f-SMOOTH_ALPHA)*smoothedFan;
         drawBar(fanStrip, lastAppliedBrightnessFan,
                 CH6_COUNT,
                 barLen(smoothedFan, FAN_FAST_MAX, CH6_COUNT),
@@ -250,7 +298,7 @@ static void updateOnce() {
       drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     }
   } else {
-    // Error indicator on first pixel(s) of enabled bars
+    // Error indicator on first pixel of enabled bars
     if (gEnableCPU && CH5_COUNT) {
       cpuStrip.setPixelColor(0,(FAIL_COLOR>>16)&0xFF,(FAIL_COLOR>>8)&0xFF,FAIL_COLOR&0xFF);
       if (lastAppliedBrightnessCpu != BRIGHTNESS) { cpuStrip.setBrightness(BRIGHTNESS); lastAppliedBrightnessCpu = BRIGHTNESS; }
@@ -272,57 +320,61 @@ void loop() {
   }
 }
 
+// Manual refresh hook
 void refreshNow() { updateOnce(); }
 
-void setCpuEnabled(bool en) { gEnableCPU = en; }
-void setFanEnabled(bool en) { gEnableFAN = en; }
+// These remain as direct controls if you want to toggle outside RGBCtrl
+void setCpuEnabled(bool en) { applyEnableFlags(en, gEnableFAN); }
+void setFanEnabled(bool en) { applyEnableFlags(gEnableCPU, en); }
 bool cpuEnabled() { return gEnableCPU; }
 bool fanEnabled() { return gEnableFAN; }
 
 bool isXcalibur() { return gIsXcalibur; }
 
-// ----- tiny REST API so the /config page (RGBCtrl) can toggle flags -----
+// Optional: tiny REST API (can be kept or removed; not required now that we mirror RGBCtrl flags)
 void attachWeb(AsyncWebServer& server, const char* basePath) {
   String base = (basePath && *basePath) ? basePath : "/config/smbus";
   String api  = base + "/api/flags";
 
-  // GET flags (+ board detection info)
   server.on(api.c_str(), HTTP_GET, [](AsyncWebServerRequest* r){
     auto* s = r->beginResponseStream("application/json");
+    // report the *effective* flags (mirroring RGBCtrl)
+    bool cpu = RGBCtrl::smbusCpuEnabled();
+    bool fan = RGBCtrl::smbusFanEnabled();
     s->printf("{\"cpu\":%s,\"fan\":%s,\"xcalibur\":%s}",
-              gEnableCPU?"true":"false", gEnableFAN?"true":"false", gIsXcalibur?"true":"false");
+              cpu?"true":"false", fan?"true":"false", gIsXcalibur?"true":"false");
     r->send(s);
   });
 
-  // POST flags {"cpu":true/false,"fan":true/false}
   server.on(api.c_str(), HTTP_POST, [](AsyncWebServerRequest* r){
     r->send(405, "text/plain", "POST with body only");
   },
   nullptr,
   [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t){
+    // Keeping this endpoint for compatibility: it toggles local flags and LEDs,
+    // but note RGBCtrl will overwrite on next poll if its saved flags differ.
     bool ok = true;
     String body((const char*)data, len);
     body.replace(" ", ""); body.replace("\n", ""); body.replace("\r", "");
     int icpu = body.indexOf("\"cpu\":");
     int ifan = body.indexOf("\"fan\":");
+    bool cpu=gEnableCPU, fan=gEnableFAN;
     if (icpu >= 0) {
       int v = body.indexOf("true", icpu);  int f = body.indexOf("false", icpu);
-      if      (v>=0 && (f<0 || v<f)) gEnableCPU = true;
-      else if (f>=0 && (v<0 || f<v)) gEnableCPU = false;
+      if      (v>=0 && (f<0 || v<f)) cpu = true;
+      else if (f>=0 && (v<0 || f<v)) cpu = false;
       else ok = false;
     }
     if (ifan >= 0) {
       int v = body.indexOf("true", ifan);  int f = body.indexOf("false", ifan);
-      if      (v>=0 && (f<0 || v<f)) gEnableFAN = true;
-      else if (f>=0 && (v<0 || f<v)) gEnableFAN = false;
+      if      (v>=0 && (f<0 || f<v)) fan = true;
+      else if (f>=0 && (v<0 || f<v)) fan = false;
       else ok = false;
     }
+    applyEnableFlags(cpu, fan);
     auto* s = req->beginResponseStream("application/json");
     s->printf("{\"ok\":%s,\"cpu\":%s,\"fan\":%s,\"xcalibur\":%s}",
-              ok?"true":"false",
-              gEnableCPU?"true":"false",
-              gEnableFAN?"true":"false",
-              gIsXcalibur?"true":"false");
+              ok?"true":"false", gEnableCPU?"true":"false", gEnableFAN?"true":"false", gIsXcalibur?"true":"false");
     req->send(s);
   });
 }
