@@ -32,6 +32,7 @@ The web UI previews changes live and saves them to flash (NVS).
 - 🧪 **SMBus (Xbox SMC) telemetry** (optional, on CH5/CH6)
   - **CPU temperature** bar (green→yellow→red, max 75 °C)
   - **Fan percentage** bar (blue→yellow→orange)
+- 🛜 **UDP control** UDP comminucation and control for XBMC4Gamers and the PC app
 
 ---
 
@@ -49,6 +50,8 @@ The web UI previews changes live and saves them to flash (NVS).
 10. **Clock Spin**  
 11. **Plasma**  
 12. **Fire / Flicker**
+13. **Palette Cycle**
+14. **Palette Chase**
 
 > The UI only shows controls that matter for the selected mode.  
 > Example: *Meteor* uses **Color A** and **Color B**; *Breathe* ignores **width**.
