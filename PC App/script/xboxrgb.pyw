@@ -57,7 +57,7 @@ def default_cfg():
     return {
         "count": [50,50,50,50],
         "brightness": 180,
-        "mode": 4,
+        "mode": 4,  # Rainbow
         "speed": 128,
         "intensity": 128,
         "width": 4,
@@ -97,21 +97,11 @@ class Device:
     mac: str = ""
 
 def discover_devices(timeout=1.2, psk: Optional[str]=None, port=DEFAULT_UDP_PORT) -> List[Device]:
-    """
-    Send UDP broadcast discovery and collect replies:
-      - JSON: {"op":"discover"} (optional "key": psk)
-      - Text fallback: "RGBDISC?"
-    Reply (JSON typical):
-      {"ok":true,"op":"discover","name":"XBOX RGB","ver":"1.4.x","port":7777,"ip":"192.168.1.23","mac":"..."}
-      Text fallback: "RGBDISC! {"ip":"...","port":...,"name":"...","ver":"...","mac":"..."}"
-    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # allow broadcast + reuse
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(timeout)
-        # bind ephemeral so replies come back to us
         sock.bind(("", 0))
 
         payload = {"op":"discover"}
@@ -119,7 +109,6 @@ def discover_devices(timeout=1.2, psk: Optional[str]=None, port=DEFAULT_UDP_PORT
         msg_json = json.dumps(payload).encode("utf-8")
         msg_txt  = b"RGBDISC?"
 
-        # send both JSON and text probes
         sock.sendto(msg_json, ("255.255.255.255", port))
         sock.sendto(msg_txt,  ("255.255.255.255", port))
 
@@ -133,7 +122,7 @@ def discover_devices(timeout=1.2, psk: Optional[str]=None, port=DEFAULT_UDP_PORT
             txt = data.decode("utf-8", errors="ignore").strip()
 
             meta = None
-            if txt.startswith("{"):  # JSON
+            if txt.startswith("{"):
                 try:
                     j = json.loads(txt)
                     if j.get("op") == "discover":
@@ -179,7 +168,6 @@ class Transport(object):
     def target_ok(self) -> bool:
         return bool(self.ip)
 
-    # UDP (fire-and-forget for preview/save/reset; request/response for get)
     def udp_send_recv(self, payload, expect_reply=True, timeout=1.2):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(timeout)
@@ -216,11 +204,9 @@ class Transport(object):
                 resp = self.udp_send_recv({"op":"get"}, expect_reply=True)
                 if resp:
                     j = json.loads(resp.decode("utf-8","ignore"))
-                    # UDP reply can be {"ok":true,"op":"get","cfg":{...}} OR already cfg
                     return j.get("cfg", j)
             except Exception:
                 pass
-        # HTTP fallback
         try:
             txt = self.http_get("/ledconfig")
             return json.loads(txt)
@@ -311,9 +297,8 @@ class ColorField(QWidget):
             self.update_swatch()
             self.parentChanged()
         else:
-            self.hex.setText(rgb_to_hex(self.rgb))  # revert
+            self.hex.setText(rgb_to_hex(self.rgb))
 
-    # Placeholder; parent installs a callback
     def parentChanged(self): pass
 
     def set_value(self, rgb):
@@ -332,16 +317,16 @@ class MainWindow(QWidget):
         self.setWindowIcon(QIcon(ICON_PATH))
         self.transport = Transport()
         self.cfg = default_cfg()
-        self.copyrightTxt = "© Darkone Customs 2025"
         self.devices: List[Device] = []
 
         self._build_ui()
         self._wire_signals()
 
         self._debounce = QTimer(self)
-        self._debounce.setInterval(120)  # ms
-        self._debounce.setSingleShot(True)
-        self._debounce.timeout.connect(self._send_preview)
+        she = self._debounce
+        she.setInterval(120)
+        she.setSingleShot(True)
+        she.timeout.connect(self._send_preview)
 
         # auto-discover at startup
         self.rescan_devices(auto=True)
@@ -392,7 +377,6 @@ class MainWindow(QWidget):
         ctrl = QGroupBox("Controls")
         g = QGridLayout()
 
-        # Mode
         self.mode = QComboBox()
         for name, val in MODES: self.mode.addItem(name, val)
 
@@ -403,6 +387,13 @@ class MainWindow(QWidget):
         self.speed      = mk_slider(0,255,128)
         self.intensity  = mk_slider(0,255,128)
         self.width      = mk_slider(1,20,4)
+
+        # Keep label refs so we can hide specific widgets (not the whole group)
+        self.lblBrightness = QLabel("Brightness")
+        self.lblSpeed      = QLabel("Speed")
+        self.lblIntensity  = QLabel("Intensity")
+        self.lblWidth      = QLabel("Width / Gap")
+        self.lblPalette    = QLabel("Palette Size")
 
         self.brightnessV = QLabel("180")
         self.speedV      = QLabel("128")
@@ -433,16 +424,16 @@ class MainWindow(QWidget):
         r = 0
         g.addWidget(QLabel("Mode"), r,0); g.addWidget(self.mode, r,1,1,2); r+=1
 
-        g.addWidget(QLabel("Brightness"), r,0)
+        g.addWidget(self.lblBrightness, r,0)
         g.addWidget(self.brightness, r,1); g.addWidget(self.brightnessV, r,2); r+=1
 
-        g.addWidget(QLabel("Speed"), r,0)
+        g.addWidget(self.lblSpeed, r,0)
         g.addWidget(self.speed, r,1); g.addWidget(self.speedV, r,2); r+=1
 
-        g.addWidget(QLabel("Intensity"), r,0)
+        g.addWidget(self.lblIntensity, r,0)
         g.addWidget(self.intensity, r,1); g.addWidget(self.intensityV, r,2); r+=1
 
-        g.addWidget(QLabel("Width / Gap"), r,0)
+        g.addWidget(self.lblWidth, r,0)
         g.addWidget(self.width, r,1); g.addWidget(self.widthV, r,2); r+=1
 
         g.addWidget(self.colorA, r,0,1,3); r+=1
@@ -450,7 +441,7 @@ class MainWindow(QWidget):
         g.addWidget(self.colorC, r,0,1,3); r+=1
         g.addWidget(self.colorD, r,0,1,3); r+=1
 
-        g.addWidget(QLabel("Palette Size"), r,0); g.addWidget(self.paletteCount, r,1,1,2); r+=1
+        g.addWidget(self.lblPalette, r,0); g.addWidget(self.paletteCount, r,1,1,2); r+=1
 
         g.addWidget(QLabel("CH1 (Front) Count"), r,0); g.addWidget(self.c0, r,1,1,2); r+=1
         g.addWidget(QLabel("CH2 (Left) Count"),  r,0); g.addWidget(self.c1, r,1,1,2); r+=1
@@ -469,7 +460,7 @@ class MainWindow(QWidget):
 
         ctrl.setLayout(g)
 
-        # Footer (copyright only; no version)
+        # Footer (copyright only)
         self.footer = QLabel("© Darkone Customs 2025")
         self.footer.setAlignment(Qt.AlignCenter)
 
@@ -515,17 +506,15 @@ class MainWindow(QWidget):
             self.deviceList.blockSignals(True)
             self.deviceList.clear()
             for d in self.devices:
-                self.deviceList.addItem(f"{d.name}  •  {d.ip}", userData=d)
+                self.deviceList.addItem(f"{d.name}  •  {d.ip}  •  v{d.ver}", userData=d)
             self.deviceList.blockSignals(False)
 
             if self.devices:
-                if auto:
-                    # pick the first device automatically
-                    self.deviceList.setCurrentIndex(0)
-                    self._device_chosen()
-                    self.reload_from_device()
+                self.deviceList.setCurrentIndex(0)
+                self._device_chosen()
                 self.status.setText(f"status: {len(self.devices)} device(s) found")
             else:
+                self.transport.ip = None
                 self.status.setText("status: no devices found (you can enable Manual IP override)")
         finally:
             QApplication.restoreOverrideCursor()
@@ -540,7 +529,7 @@ class MainWindow(QWidget):
         self.transport.udp_port = d.port
         self.ipEdit.setText(d.ip)
         self.portEdit.setText(str(d.port))
-        self.status.setText(f"status: selected {d.ip}")
+        self.reload_from_device()  # load immediately
 
     def _toggle_udp(self, _):
         self.transport.use_udp = self.useUDP.isChecked()
@@ -593,10 +582,10 @@ class MainWindow(QWidget):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             cfg = self.transport.get_config()
-            # Footer: copyright only (fallback to local default)
-            self.copyrightTxt = cfg.get("copyright", "© Darkone Customs 2025")
-            self.footer.setText(self.copyrightTxt)
-            # Controls
+            m = cfg.get("mode", 4)
+            if not isinstance(m, int) or m < 0 or m > 13:
+                cfg["mode"] = 4  # Rainbow default
+            self.footer.setText(cfg.get("copyright", "© Darkone Customs 2025"))
             self._cfg_to_ui(cfg)
             self.status.setText("status: ready")
         except Exception as e:
@@ -631,9 +620,10 @@ class MainWindow(QWidget):
     # --------------- Mapping UI <-> JSON ------------------
     def _cfg_to_ui(self, cfg):
         self.cfg = cfg
+        desired = cfg.get("mode", 4)
         idx = 0
         for i,(name,val) in enumerate(MODES):
-            if val == cfg.get("mode",4): idx=i; break
+            if val == desired: idx=i; break
         self.mode.setCurrentIndex(idx)
 
         self.brightness.setValue(clamp(cfg.get("brightness",180),1,255))
@@ -686,13 +676,25 @@ class MainWindow(QWidget):
     def _update_visibility(self):
         mode = MODES[self.mode.currentIndex()][1]
         def vis(key): return (mode in VIS.get(key,set()))
-        self.intensity.parentWidget().setVisible(vis("intensity"))
-        self.width.parentWidget().setVisible(vis("width"))
+        # individual widgets (do NOT hide the entire group)
+        use_int = vis("intensity")
+        self.lblIntensity.setVisible(use_int)
+        self.intensity.setVisible(use_int)
+        self.intensityV.setVisible(use_int)
+
+        use_w = vis("width")
+        self.lblWidth.setVisible(use_w)
+        self.width.setVisible(use_w)
+        self.widthV.setVisible(use_w)
+
+        # Colors / palette
         self.colorA.setVisible(vis("colorA"))
         self.colorB.setVisible(vis("colorB"))
         palActive = vis("palette")
+        self.lblPalette.setVisible(palActive)
         self.paletteCount.setVisible(palActive)
-        pc = self.paletteCount.currentData()
+
+        pc = self.paletteCount.currentData() or 2
         self.colorC.setVisible(palActive and pc >= 3 and vis("colorC"))
         self.colorD.setVisible(palActive and pc >= 4 and vis("colorD"))
 
