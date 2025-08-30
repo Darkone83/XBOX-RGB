@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
 #include <ESPAsyncWebServer.h>
+#include <WiFiUdp.h>   // <-- added for Type-D guard listener
 
 // Read the toggles saved by RGBCtrl's Web UI (no extra REST needed)
 namespace RGBCtrl {
@@ -73,6 +74,30 @@ static bool gIsXcalibur  = false;
 // track last applied brightness
 static uint8_t lastAppliedBrightnessCpu = 0xFF;
 static uint8_t lastAppliedBrightnessFan = 0xFF;
+
+// -------- Type-D Expansion guard (UDP presence beacon) --------
+static WiFiUDP guardUdp;
+static const uint16_t TYPE_D_PORT = 50502;            // beacons arrive here
+static unsigned long lastTypeDSeen = 0;
+static const unsigned long TYPE_D_TTL_MS = 10000;     // treat as present for 10s after last ping
+
+static void pollTypeD() {
+  // Non-blocking: consume any pending datagrams
+  int len = guardUdp.parsePacket();
+  while (len > 0) {
+    char msg[64];
+    int r = guardUdp.read((uint8_t*)msg, (len < 63 ? len : 63));
+    msg[r > 0 ? r : 0] = '\0';
+    // Broadcast payload expected: "TYPE_D_ID:6"
+    if (strstr(msg, "TYPE_D_ID:6")) {
+      lastTypeDSeen = millis();
+    }
+    len = guardUdp.parsePacket(); // check next datagram if queued
+  }
+}
+static inline bool typeDPresent() {
+  return (millis() - lastTypeDSeen) < TYPE_D_TTL_MS;
+}
 
 // ---------- helpers ----------
 static inline float clampf(float v, float lo, float hi) {
@@ -187,7 +212,7 @@ static bool readCpuCelsius(uint8_t& outC) {
 static bool readFanPercent(uint8_t& outPct) {
   uint8_t v=0;
   if (!readMedianByte(SMC_ADDRESS, REG_FANSPEED, v)) return false;
-  uint16_t pct = (v <= 50) ? (uint16_t)v * 2u : (uint16_t)v; // 0..50 → %
+  uint16_t pct = (v <= 50) ? (uint16_t)v * 2u : (uint16_t)v; // 0..50 → % (some FW already 0..100)
   if (pct > 100) pct = 100;
   outPct = (uint8_t)pct;
   return true;
@@ -231,7 +256,7 @@ void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
   lastAppliedBrightnessFan = BRIGHTNESS;
 
   Wire.begin(PINS.sda, PINS.scl);
-  Wire.setClock(72000);     // <<<<<< requested 72 kHz
+  Wire.setClock(72000);     // requested ~72 kHz
 #ifdef ARDUINO_ARCH_ESP32
   Wire.setTimeOut(20);      // keep bus stalls short to avoid UI hiccups
 #endif
@@ -243,11 +268,21 @@ void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
 
   // Initialize local flags from RGBCtrl's saved state
   applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
+
+  // Start Type-D beacon listener
+  guardUdp.begin(TYPE_D_PORT);
 }
 
 static void updateOnce() {
   // Mirror UI flags on every cycle (cheap & keeps in sync)
   applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
+
+  // Guard: if Type-D is present, avoid bus clash — blank bars and skip SMBus
+  if (typeDPresent()) {
+    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    return;
+  }
 
   // If both disabled, skip the bus entirely and ensure LEDs are off
   if (!gEnableCPU && !gEnableFAN) {
@@ -313,6 +348,9 @@ static void updateOnce() {
 }
 
 void loop() {
+  // Always keep guard presence fresh
+  pollTypeD();
+
   uint32_t now = millis();
   if (now - lastPoll >= POLL_INTERVAL_MS) {
     lastPoll = now;
@@ -331,18 +369,31 @@ bool fanEnabled() { return gEnableFAN; }
 
 bool isXcalibur() { return gIsXcalibur; }
 
-// Optional: tiny REST API (can be kept or removed; not required now that we mirror RGBCtrl flags)
+// Optional: tiny REST API. Now includes guard info so the Web UI
+// can show that SMBus is temporarily disabled by Type-D presence.
 void attachWeb(AsyncWebServer& server, const char* basePath) {
   String base = (basePath && *basePath) ? basePath : "/config/smbus";
   String api  = base + "/api/flags";
 
   server.on(api.c_str(), HTTP_GET, [](AsyncWebServerRequest* r){
+    bool cpuSaved = RGBCtrl::smbusCpuEnabled();
+    bool fanSaved = RGBCtrl::smbusFanEnabled();
+    bool guarded  = typeDPresent();
+
+    // Effective flags reflect guard
+    bool cpuEff = guarded ? false : cpuSaved;
+    bool fanEff = guarded ? false : fanSaved;
+
     auto* s = r->beginResponseStream("application/json");
-    // report the *effective* flags (mirroring RGBCtrl)
-    bool cpu = RGBCtrl::smbusCpuEnabled();
-    bool fan = RGBCtrl::smbusFanEnabled();
-    s->printf("{\"cpu\":%s,\"fan\":%s,\"xcalibur\":%s}",
-              cpu?"true":"false", fan?"true":"false", gIsXcalibur?"true":"false");
+    s->printf("{\"cpu\":%s,\"fan\":%s,\"savedCpu\":%s,\"savedFan\":%s,"
+              "\"guarded\":%s,\"guardReason\":\"%s\",\"xcalibur\":%s}",
+              cpuEff?"true":"false",
+              fanEff?"true":"false",
+              cpuSaved?"true":"false",
+              fanSaved?"true":"false",
+              guarded?"true":"false",
+              guarded?"TypeD":"none",
+              gIsXcalibur?"true":"false");
     r->send(s);
   });
 
@@ -351,8 +402,7 @@ void attachWeb(AsyncWebServer& server, const char* basePath) {
   },
   nullptr,
   [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t){
-    // Keeping this endpoint for compatibility: it toggles local flags and LEDs,
-    // but note RGBCtrl will overwrite on next poll if its saved flags differ.
+    // Keep compatibility: allows toggling local flags, but guard still applies.
     bool ok = true;
     String body((const char*)data, len);
     body.replace(" ", ""); body.replace("\n", ""); body.replace("\r", "");
@@ -372,9 +422,19 @@ void attachWeb(AsyncWebServer& server, const char* basePath) {
       else ok = false;
     }
     applyEnableFlags(cpu, fan);
+
+    bool guarded  = typeDPresent();
+    bool cpuEff = guarded ? false : gEnableCPU;
+    bool fanEff = guarded ? false : gEnableFAN;
+
     auto* s = req->beginResponseStream("application/json");
-    s->printf("{\"ok\":%s,\"cpu\":%s,\"fan\":%s,\"xcalibur\":%s}",
-              ok?"true":"false", gEnableCPU?"true":"false", gEnableFAN?"true":"false", gIsXcalibur?"true":"false");
+    s->printf("{\"ok\":%s,\"cpu\":%s,\"fan\":%s,\"guarded\":%s,\"guardReason\":\"%s\",\"xcalibur\":%s}",
+              ok?"true":"false",
+              cpuEff?"true":"false",
+              fanEff?"true":"false",
+              guarded?"true":"false",
+              guarded?"TypeD":"none",
+              gIsXcalibur?"true":"false");
     req->send(s);
   });
 }

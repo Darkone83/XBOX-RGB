@@ -10,7 +10,7 @@
 namespace WiFiMgr { AsyncWebServer& getServer(); }
 
 // -------------------- Build / Branding --------------------
-static const char* APP_VERSION = "1.5"; // shown in footer
+static const char* APP_VERSION = "1.5.1 Beta"; // shown in footer
 static const char* COPYRIGHT_TXT = "© Darkone Customs 2025";
 
 // -------------------- Limits / Types --------------------
@@ -34,7 +34,7 @@ struct RgbColor {
 static RGBCtrlPins PINS{1,2,3,4};
 
 // If a strip is physically reversed, flip here (CH1..CH4).
-static bool REVERSE[NUM_CH] = { false, false, false, false };
+static bool REVERSE[NUM_CH] = { true, false, false, true };
 
 // Adafruit_NeoPixel strips (GRB, 800kHz)
 static Adafruit_NeoPixel strip1(MAX_PER_CH, 1, NEO_GRB + NEO_KHZ800);
@@ -382,7 +382,7 @@ static void animFire() {
   const uint8_t COOL_BASE = 50;   // was 55 (less cooling = brighter)
   const uint8_t COOL_SPAN = 36;   // was 40  (keeps similar range)
   const uint8_t SPARK_ADD_BASE = 180; // was 160 (hotter sparks)
-  const uint8_t HEAT_BIAS = 20;   // +20 heat before color map (push into yellow/white a bit)
+  const uint8_t HEAT_BIAS = 65;   // +20 heat before color map (push into yellow/white a bit)
 
   // 1) cool down each cell a little
   uint8_t cool = COOL_BASE - (uint8_t)((uint16_t)CFG.intensity * COOL_SPAN / 255); // ~14..50
@@ -409,7 +409,7 @@ static void animFire() {
 
   // 4) map heat to color (biased a bit upward → less red, more yellow/white)
   //    thresholds slightly compressed so white appears a little sooner
-  const uint8_t TH1 = 72;   // red → full red sooner (was ~85)
+  const uint8_t TH1 = 35;   // red → full red sooner (was ~85)
   const uint8_t TH2 = 160;  // red/yellow band ends a touch earlier (was ~170)
 
   for (uint16_t i = 0; i < L; ++i) {
