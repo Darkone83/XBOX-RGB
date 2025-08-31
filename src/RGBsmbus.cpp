@@ -2,7 +2,11 @@
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
 #include <ESPAsyncWebServer.h>
-#include <WiFiUdp.h>   // <-- added for Type-D guard listener
+#include <WiFiUdp.h>   // Type-D guard listener
+
+// === UDP quiet-window hook (no heavy JSON parsing while we touch SMBus) ===
+// (Declared in RGBudp.h; forward-declare here to avoid hard include dependency)
+namespace RGBCtrlUDP { void enterSmbusQuietUs(uint32_t dur_us); }
 
 // Read the toggles saved by RGBCtrl's Web UI (no extra REST needed)
 namespace RGBCtrl {
@@ -161,7 +165,11 @@ static void drawBar(Adafruit_NeoPixel& strip,
 }
 
 // ---------- SMBus (robust reads) ----------
+// We place a *small* UDP quiet window before each attempt so JSON handling
+// won’t preempt timing-sensitive SMBus transactions. The window is extended
+// if we call it again while it’s still active.
 static bool readTryRepeatedStart(uint8_t addr7, uint8_t reg, uint8_t& value) {
+  RGBCtrlUDP::enterSmbusQuietUs(1600); // guard this transaction
   Wire.beginTransmission(addr7);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false; // no STOP
@@ -170,6 +178,7 @@ static bool readTryRepeatedStart(uint8_t addr7, uint8_t reg, uint8_t& value) {
   return true;
 }
 static bool readTryStopThenRead(uint8_t addr7, uint8_t reg, uint8_t& value) {
+  RGBCtrlUDP::enterSmbusQuietUs(1800); // guard this transaction (STOP + short delay + read)
   Wire.beginTransmission(addr7);
   Wire.write(reg);
   if (Wire.endTransmission(true) != 0) return false;  // with STOP
@@ -180,7 +189,10 @@ static bool readTryStopThenRead(uint8_t addr7, uint8_t reg, uint8_t& value) {
 }
 static bool readSMBusByteRobust(uint8_t addr7, uint8_t reg, uint8_t& value) {
   for (uint8_t attempt=0; attempt<3; ++attempt) {
+    // Extend the quiet window at the start of each attempt
+    RGBCtrlUDP::enterSmbusQuietUs(2000);
     if (readTryRepeatedStart(addr7, reg, value)) return true;
+    RGBCtrlUDP::enterSmbusQuietUs(2000);
     if (readTryStopThenRead(addr7, reg, value))  return true;
     delay(2);
   }
@@ -190,6 +202,8 @@ static bool readMedianByte(uint8_t addr7, uint8_t reg, uint8_t& out) {
   uint8_t got = 0, a=0, b=0, c=0;
   for (uint8_t i=0; i<3; ++i) {
     uint8_t v=0;
+    // Guard each sample; window will extend if we loop quickly.
+    RGBCtrlUDP::enterSmbusQuietUs(1800);
     if (readSMBusByteRobust(addr7, reg, v)) {
       if (got==0) a=v; else if (got==1) b=v; else c=v;
       ++got;
@@ -290,6 +304,10 @@ static void updateOnce() {
     if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
   }
+
+  // Wrap the whole poll with a coarse quiet window as a belt-and-suspenders.
+  // Subsequent per-attempt guards will extend this if needed.
+  RGBCtrlUDP::enterSmbusQuietUs(3500);
 
   bool ok = true;
   int cpuC = -1;

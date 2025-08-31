@@ -14,4 +14,10 @@ void loop();
 // Optionally broadcast a discovery becon once (useful after WiFi connects).
 void sendDiscovery();
 
+// NEW: Process queued heavy ops (apply preview/save/counts/reset) with a time budget (µs).
+void processPending(uint32_t budget_us = 1500);
+
+// Ask UDP code to avoid heavy JSON work for at least `dur_us` microseconds.
+void enterSmbusQuietUs(uint32_t dur_us);
+
 } // namespace RGBCtrlUDP

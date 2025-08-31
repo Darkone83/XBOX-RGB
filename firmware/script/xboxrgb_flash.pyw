@@ -24,7 +24,7 @@ except Exception:
 
 APP_NAME = "XBOX RGB Flasher"
 ICON_PATH = "dc.ico"
-DEFAULT_BAUD = "460800"   # conservative + fast enough
+DEFAULT_BAUD = "921600"   # conservative + fast enough
 FLASH_OFFSET = "0x0"      # merged image starts at 0x0
 
 # --------------------------------------------------------------------
@@ -209,13 +209,9 @@ class FlasherApp(tk.Tk):
         # Build esptool command
         cmd = [
             sys.executable, "-m", "esptool",
-            "--chip", "auto",
             "--port", port,
             "--baud", DEFAULT_BAUD,
-            "--before", "default_reset",
-            "--after", "hard_reset",
             "write_flash",
-            "-z",
             FLASH_OFFSET, bin_path
         ]
 

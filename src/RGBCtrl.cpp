@@ -1,4 +1,5 @@
 #include "RGBCtrl.h"
+#include "RGBudp.h"
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
@@ -10,7 +11,7 @@
 namespace WiFiMgr { AsyncWebServer& getServer(); }
 
 // -------------------- Build / Branding --------------------
-static const char* APP_VERSION = "1.5.1 Beta"; // shown in footer
+static const char* APP_VERSION = "1.5.2"; // shown in footer
 static const char* COPYRIGHT_TXT = "© Darkone Customs 2025";
 
 // -------------------- Limits / Types --------------------
@@ -33,8 +34,8 @@ struct RgbColor {
 // Ring order is CH1 -> CH2 -> CH3 -> CH4; animations start at CH1 index 0.
 static RGBCtrlPins PINS{1,2,3,4};
 
-// If a strip is physically reversed, flip here (CH1..CH4).
-static bool REVERSE[NUM_CH] = { true, false, false, true };
+// Compile-time defaults (kept as initial seeds)
+static bool REVERSE_DEFAULTS[NUM_CH] = { true, false, false, true };
 
 // Adafruit_NeoPixel strips (GRB, 800kHz)
 static Adafruit_NeoPixel strip1(MAX_PER_CH, 1, NEO_GRB + NEO_KHZ800);
@@ -67,6 +68,10 @@ struct AppConfig {
   // SMBus toggles (UI checkboxes)
   bool     enableCpu     = true;
   bool     enableFan     = true;
+
+  // NEW: per-channel reverse (runtime toggles; seeded from compile-time defaults)
+  bool     reverse[NUM_CH] = { REVERSE_DEFAULTS[0], REVERSE_DEFAULTS[1],
+                               REVERSE_DEFAULTS[2], REVERSE_DEFAULTS[3] };
 } CFG;
 
 static bool inPreview = false;
@@ -133,9 +138,8 @@ static void setRing(uint16_t idx, const RgbColor& c) {
   for (uint8_t s=0; s<NUM_CH; ++s) {
     if (idx < base + segs[s].count) {
       uint16_t within = idx - base;
-      uint16_t px = (REVERSE[segs[s].ch] && segs[s].count)
-                    ? (segs[s].count - 1 - within)
-                    : within;
+      bool rev = CFG.reverse[segs[s].ch] && segs[s].count;
+      uint16_t px = rev ? (segs[s].count - 1 - within) : within;
       STRIPS[segs[s].ch]->setPixelColor(px, c.R, c.G, c.B);
       return;
     }
@@ -247,14 +251,37 @@ static void loadMotionPalette(uint8_t& n, RgbColor p[4]){
 
 // -------------------- Animations --------------------
 static void animSolid() { fillRing(rgbFrom24(CFG.colorA)); }
+
+// ---- UPDATED: smoother Breathe (ease + low-pass to remove stepping) ----
 static void animBreathe() {
-  float t = (tick * (CFG.speed/255.0f)) * 0.05f;
-  float s = (sinf(t) * 0.5f + 0.5f);
-  uint8_t lvl = (uint8_t)(30 + s * 225);
+  uint16_t L = ringLen(); if (!L) return;
+
+  // Phase advances with speed; keep independent of tick granularity
+  static float phase = 0.f;
+  float step = 0.010f + (CFG.speed / 255.0f) * 0.045f; // ~slow → faster
+  phase += step;
+
+  // Base waveform 0..1 and eased (smoothstep) to avoid harsh edges
+  float s = 0.5f + 0.5f * sinf(phase * 6.2831853f);
+  float eased = s*s*(3.f - 2.f*s);
+
+  // Keep a small floor so LEDs never fully black
+  float target = 0.10f + 0.90f * eased;
+
+  // Low-pass filter the level to smooth frame pacing artifacts
+  static float lvl = 0.0f;
+  float alpha = 0.10f;                       // smoothing factor
+  lvl = lvl*(1.0f - alpha) + target*alpha;  // 0..1
+
   RgbColor base = rgbFrom24(CFG.colorA);
-  RgbColor cur(uint8_t((base.R*lvl)/255), uint8_t((base.G*lvl)/255), uint8_t((base.B*lvl)/255));
+  RgbColor cur(
+    (uint8_t)(base.R * lvl),
+    (uint8_t)(base.G * lvl),
+    (uint8_t)(base.B * lvl)
+  );
   fillRing(cur);
 }
+
 static void animColorWipe(bool forward=true) {
   uint16_t L = ringLen(); if (!L) return;
   RgbColor off(0,0,0); fillRing(off);
@@ -304,20 +331,61 @@ static void animTheater() {
     setRing(i, c);
   }
 }
+
+// ---- UPDATED: Twinkle with per-pixel glints (rise & fall) ----
 static void animTwinkle() {
-  int f = 5 + (CFG.speed/3); if (f > 254) f = 254;
+  uint16_t L = ringLen(); if (!L) return;
+
+  // Fade background (speed controls fade speed)
+  int f = 18 + (CFG.speed/2); if (f > 254) f = 254;
   uint8_t fadeAmt = (uint8_t)(255 - f);
   fadeRing(fadeAmt);
-  uint16_t L = ringLen(); if (!L) return;
-  uint16_t pops = 1 + (uint16_t)((CFG.intensity/255.0f) * (L/3 + 1));
-  uint8_t n; RgbColor pal[4]; loadMotionPalette(n, pal);
-  float phase = tick * 0.0025f;
-  for (uint16_t i=0; i<pops; ++i) {
-    uint16_t k = esp_random()%L;
-    float x = (k/(float)L) + phase + (float)(esp_random() & 0xFF)/255.0f * 0.1f;
-    setRing(k, samplePalette(x, n, pal, CFG.intensity));
+
+  // Per-pixel twinkle phase 0=off, 1..255 = active progress
+  static uint8_t phase[MAX_RING] = {0};
+
+  // Number of new twinkles per frame (scales with intensity and ring size)
+  uint16_t pops = 1 + (uint16_t)((CFG.intensity * L) / (255 * 30) + 0.5f); // up to ~7 on 200px
+
+  // Spawn new twinkles on currently inactive pixels
+  for (uint16_t n=0; n<pops; ++n) {
+    uint16_t k = esp_random() % L;
+    if (phase[k] == 0) phase[k] = 1 + (esp_random() & 1); // start
+  }
+
+  // Palette for coloration
+  uint8_t pn; RgbColor pal[4]; loadMotionPalette(pn, pal);
+  float palPhase = tick * 0.0025f;
+
+  // Per-frame phase advance: higher speed = faster glint; width lengthens the glint
+  int advance = 2 + (CFG.speed / 24) - (CFG.width / 6);
+  if (advance < 1) advance = 1;
+
+  for (uint16_t i=0; i<L; ++i) {
+    uint8_t ph = phase[i];
+    if (ph == 0) continue;
+
+    // Normalize to 0..1 and give a sharp twinkle curve (sin^3)
+    float x = ph / 255.0f;
+    float b = sinf(3.1415926f * x);
+    b = b*b*b; // sharper peak
+
+    // Sample palette and scale by brightness
+    float u = (i/(float)L) + palPhase;
+    RgbColor base = samplePalette(u, pn, pal, CFG.intensity);
+    RgbColor c(
+      (uint8_t)(base.R * b),
+      (uint8_t)(base.G * b),
+      (uint8_t)(base.B * b)
+    );
+    setRing(i, c);
+
+    // Advance / finish
+    uint16_t next = ph + advance;
+    phase[i] = (next >= 255) ? 0 : (uint8_t)next;
   }
 }
+
 static void animComet() {
   uint16_t L = ringLen(); if (!L) return;
   int denom = 4 - (CFG.speed/64); if (denom < 1) denom = 1;
@@ -337,21 +405,81 @@ static void animComet() {
     setRing((pos + L - w) % L, c);
   }
 }
+
+// ---- UPDATED: Meteor → Meteor Shower (multiple heads with tapered tails) ----
 static void animMeteor() {
   uint16_t L = ringLen(); if (!L) return;
-  int denom = 4 - (CFG.speed/64); if (denom < 1) denom = 1;
-  uint16_t pos = (tick / (uint16_t)denom) % L;
+
+  // Fade existing trails
   uint8_t fadeAmt = (uint8_t)(210 - (CFG.intensity > 209 ? 209 : CFG.intensity));
   fadeRing(fadeAmt);
-  RgbColor a = rgbFrom24(CFG.colorA);
-  RgbColor b = rgbFrom24(CFG.colorB);
-  uint8_t wmax = (CFG.width < 1) ? 1 : CFG.width;
-  for (uint8_t w=0; w<wmax; ++w) {
-    float t = w / float(wmax);
-    RgbColor mix(uint8_t(a.R*(1-t)+b.R*t), uint8_t(a.G*(1-t)+b.G*t), uint8_t(a.B*(1-t)+b.B*t));
-    setRing((pos + w) % L, mix);
+
+  // How many concurrent meteors (1..8)
+  const uint8_t MAXM = 8;
+  uint8_t count = 1 + (uint8_t)((CFG.intensity * (MAXM-1)) / 255);
+
+  // Persistent meteor state
+  static bool   inited = false;
+  static float  pos[MAXM];
+  static float  vel[MAXM];
+  static uint8_t len[MAXM];
+  static uint16_t lastL = 0;
+
+  if (!inited || lastL != L) {
+    for (uint8_t m=0; m<MAXM; ++m) {
+      pos[m] = (float)(esp_random() % L);
+      vel[m] = 0.35f + 1.25f * ((esp_random() & 255) / 255.0f); // px/frame
+      len[m] = 2 + (esp_random() % 6);
+    }
+    inited = true;
+    lastL = L;
+  }
+
+  // Tail length mapped to width (2..(2+2*width))
+  uint8_t baseTail = 2 + (uint8_t)(CFG.width * 2);
+
+  // Palette
+  uint8_t pn; RgbColor pal[4]; loadMotionPalette(pn, pal);
+  float pphase = tick * 0.004f;
+
+  // Speed multiplier (higher speed slider => faster meteors)
+  float speedMul = 0.5f + 2.0f * (CFG.speed / 255.0f);
+
+  for (uint8_t m=0; m<count; ++m) {
+    // Advance & wrap
+    pos[m] += vel[m] * speedMul;
+    while (pos[m] >= L) pos[m] -= L;
+
+    // Color head from palette varying by position
+    float hu = (pos[m] / (float)L) + pphase;
+    RgbColor head = samplePalette(hu, pn, pal, CFG.intensity);
+
+    // Draw head
+    setRing((uint16_t)pos[m], head);
+
+    // Draw tapered tail behind the head
+    uint8_t tl = baseTail + len[m];
+    for (uint8_t k=1; k<=tl; ++k) {
+      float t = k / (float)tl;  // 0..1
+      float fall = (1.0f - t);
+      fall *= fall;             // quadratic falloff
+      RgbColor c(
+        (uint8_t)(head.R * fall),
+        (uint8_t)(head.G * fall),
+        (uint8_t)(head.B * fall)
+      );
+      uint16_t p = ((int)pos[m] - k + L*4) % L;
+      setRing(p, c);
+    }
+
+    // Occasionally randomize a meteor to keep the shower organic
+    if ((esp_random() & 255) < 4) {
+      vel[m] = 0.35f + 1.25f * ((esp_random() & 255) / 255.0f);
+      len[m] = 2 + (esp_random() % 6);
+    }
   }
 }
+
 static void animClockSpin() {
   uint16_t L = ringLen(); if (!L) return;
   int denom = 3 - (CFG.speed/85); if (denom < 1) denom = 1;
@@ -363,18 +491,43 @@ static void animClockSpin() {
   if (span < 1) span = 1;
   for (uint8_t w=0; w<span; ++w) setRing((pos + w) % L, fg);
 }
+
+// ---- UPDATED: Richer Plasma (multi-octave field, contrast & sparkle) ----
 static void animPlasma() {
   uint16_t L = ringLen(); if (!L) return;
-  float t  = tick * (0.02f + (CFG.speed/255.0f)*0.06f);
+
+  static float t = 0.f;
+  float tstep = 0.015f + (CFG.speed / 255.0f) * 0.050f;
+  t += tstep;
+
+  const float drift = sinf(t * 0.23f) * 0.35f + sinf(t * 0.11f + 1.3f) * 0.15f;
+
+  // User controls mapping
+  const float satBase  = 0.55f + (CFG.intensity / 255.0f) * 0.45f; // 0.55..1.0
+  const float contrast = 0.90f + (CFG.width     / 20.0f) * 0.60f;  // ~0.9..1.5
+  const float sparkAmp = 0.06f * (CFG.intensity / 255.0f);
+
   for (uint16_t i=0; i<L; ++i) {
-    float a = (float)i / (float)L * 6.2831853f; // 0..2π
-    float v = 0.5f + 0.5f * (sinf(3*a + t) * 0.5f + sinf(5*a - t*0.8f) * 0.5f);
-    float sat = 0.4f + (CFG.intensity/255.0f)*0.6f;
-    float con = 0.7f + (CFG.width/20.0f)*0.6f;
-    float hue = fmodf((v*con + t*0.03f), 1.0f);
-    setRing(i, hsv2rgb(hue, sat, 1.0f));
+    const float u = (float)i / (float)L;
+    const float a = u * 6.2831853f; // 0..2π
+
+    // Multi-octave sine field
+    const float f1 = sinf(3.0f * a + t)                * 0.55f;
+    const float f2 = sinf(5.0f * a - t * 0.8f + drift) * 0.35f;
+    const float f3 = sinf(6.3f * a + t * 1.6f)         * 0.20f;
+    float field = (f1 + f2 + f3) * 0.5f + 0.5f; // normalize to ~0..1
+
+    // Local sparkle + contrast
+    float v = field * contrast + sparkAmp * sinf(a * 8.0f - t * 2.2f);
+    if (v < 0.f) v = 0.f; if (v > 1.f) v = 1.f;
+
+    const float hue = fmodf(field * 1.2f + t * 0.05f, 1.0f);
+    const float sat = satBase;
+
+    setRing(i, hsv2rgb(hue, sat, v));
   }
 }
+
 static void animFire() {
   uint16_t L = ringLen(); if (!L) return;
 
@@ -408,26 +561,22 @@ static void animFire() {
   }
 
   // 4) map heat to color (biased a bit upward → less red, more yellow/white)
-  //    thresholds slightly compressed so white appears a little sooner
-  const uint8_t TH1 = 35;   // red → full red sooner (was ~85)
-  const uint8_t TH2 = 160;  // red/yellow band ends a touch earlier (was ~170)
+  const uint8_t TH1 = 35;
+  const uint8_t TH2 = 160;
 
   for (uint16_t i = 0; i < L; ++i) {
     uint16_t q16 = (uint16_t)heat[i] + HEAT_BIAS;
-    uint8_t  t   = (q16 > 255) ? 255 : (uint8_t)q16;
+    uint8_t  t8  = (q16 > 255) ? 255 : (uint8_t)q16;
 
     RgbColor c;
-    if (t < TH1) {
-      // ramp to full red a bit earlier
-      uint8_t r = (uint16_t)t * 255 / TH1;  // 0..255
+    if (t8 < TH1) {
+      uint8_t r = (uint16_t)t8 * 255 / TH1;  // 0..255
       c = RgbColor(r, 0, 0);
-    } else if (t < TH2) {
-      // full red, green ramps to yellow
-      uint8_t g = (uint16_t)(t - TH1) * 255 / (TH2 - TH1);
+    } else if (t8 < TH2) {
+      uint8_t g = (uint16_t)(t8 - TH1) * 255 / (TH2 - TH1);
       c = RgbColor(255, g, 0);
     } else {
-      // yellow → white (blue ramps in)
-      uint8_t b = (uint16_t)(t - TH2) * 255 / (255 - TH2);
+      uint8_t b = (uint16_t)(t8 - TH2) * 255 / (255 - TH2);
       c = RgbColor(255, 255, b);
     }
     setRing(i, c);
@@ -527,6 +676,10 @@ static String configToJson() {
   doc["enableFan"]    = CFG.enableFan;
   doc["inPreview"]    = inPreview;
 
+  // NEW: per-channel reverse
+  JsonArray rev = doc.createNestedArray("reverse");
+  for (uint8_t i=0;i<NUM_CH;++i) rev.add(CFG.reverse[i]);
+
   // Non-persistent display info
   doc["buildVersion"] = APP_VERSION;
   doc["copyright"]    = COPYRIGHT_TXT;
@@ -575,6 +728,17 @@ static bool parseConfig(const String& body, AppConfig& out) {
   if (doc.containsKey("resumeOnBoot"))out.resumeOnBoot= doc["resumeOnBoot"].as<bool>();
   if (doc.containsKey("enableCpu"))   out.enableCpu   = doc["enableCpu"].as<bool>();
   if (doc.containsKey("enableFan"))   out.enableFan   = doc["enableFan"].as<bool>();
+
+  // NEW: per-channel reverse
+  if (doc.containsKey("reverse")) {
+    for (uint8_t i=0;i<NUM_CH;++i) {
+      // guard against missing or short arrays
+      if (!doc["reverse"][i].isNull()) {
+        out.reverse[i] = doc["reverse"][i].as<bool>();
+      }
+    }
+  }
+
   return true;
 }
 static void applyConfig() {
@@ -623,6 +787,16 @@ static void loadConfig() {
     if (doc.containsKey("resumeOnBoot"))tmp.resumeOnBoot= doc["resumeOnBoot"].as<bool>();
     if (doc.containsKey("enableCpu"))   tmp.enableCpu   = doc["enableCpu"].as<bool>();
     if (doc.containsKey("enableFan"))   tmp.enableFan   = doc["enableFan"].as<bool>();
+
+    // NEW: per-channel reverse
+    if (doc.containsKey("reverse")) {
+      for (uint8_t i=0;i<NUM_CH;++i) {
+        if (!doc["reverse"][i].isNull()) {
+          tmp.reverse[i] = doc["reverse"][i].as<bool>();
+        }
+      }
+    }
+
     CFG = tmp;
   }
 }
@@ -643,6 +817,10 @@ static void saveConfig() {
   doc["resumeOnBoot"] = CFG.resumeOnBoot;
   doc["enableCpu"]    = CFG.enableCpu;
   doc["enableFan"]    = CFG.enableFan;
+
+  // NEW: per-channel reverse
+  JsonArray rev = doc.createNestedArray("reverse");
+  for (uint8_t i=0;i<NUM_CH;++i) rev.add(CFG.reverse[i]);
 
   String js; serializeJson(doc, js);
   prefs.begin(NVS_NS, false);
@@ -672,6 +850,10 @@ button.primary{background:#2563eb;border:0}
 .toggle{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .footer{color:var(--muted);font-size:12px;text-align:center;padding:8px 0 24px}
 .sep{margin:0 8px}
+fieldset{border:1px solid #273657;border-radius:12px;padding:8px 10px}
+legend{padding:0 6px;color:#9ec1ff;font-size:12px}
+.inline{display:flex;gap:10px;flex-wrap:wrap}
+.inline>label{display:flex;align-items:center;gap:6px;margin:0}
 </style></head><body><div class="container">
 <div class="card">
   <h2 class="h">RGB Controller (CH1–CH4)<span id="status" class="badge">loading…</span></h2>
@@ -716,6 +898,19 @@ button.primary{background:#2563eb;border:0}
     <div class="md-3"><label>CH2 (Left) Count</label><input id="c1" type="number" min="0" max="50"></div>
     <div class="md-3"><label>CH3 (Rear) Count</label><input id="c2" type="number" min="0" max="50"></div>
     <div class="md-3"><label>CH4 (Right) Count</label><input id="c3" type="number" min="0" max="50"></div>
+
+    <!-- NEW: per-channel reverse toggles -->
+    <div class="md-12">
+      <fieldset>
+        <legend>Channel Direction</legend>
+        <div class="inline">
+          <label><input id="rev0" type="checkbox"> Reverse CH1 (Front)</label>
+          <label><input id="rev1" type="checkbox"> Reverse CH2 (Left)</label>
+          <label><input id="rev2" type="checkbox"> Reverse CH3 (Rear)</label>
+          <label><input id="rev3" type="checkbox"> Reverse CH4 (Right)</label>
+        </div>
+      </fieldset>
+    </div>
 
     <div class="md-6"><label>Resume last mode on boot</label>
       <select id="resume"><option value="true">Yes</option><option value="false">No</option></select>
@@ -800,6 +995,11 @@ function fillForm(s){
   el('colorD').value    = hex24(s.colorD || 0);
   el('paletteCount').value = s.paletteCount || 2;
   for(let i=0;i<4;i++) el('c'+i).value = s.count[i];
+
+  // NEW: reverse flags
+  const rev = s.reverse || [false,false,false,false];
+  for(let i=0;i<4;i++) { const n = el('rev'+i); if (n) n.checked = !!rev[i]; }
+
   el('resume').value    = s.resumeOnBoot ? 'true' : 'false';
   el('smbusCpu').checked= !!s.enableCpu;
   el('smbusFan').checked= !!s.enableFan;
@@ -812,6 +1012,7 @@ function fillForm(s){
 }
 
 function gather(){
+  const reverse = [0,1,2,3].map(i => !!el('rev'+i).checked);
   return {
     mode:+el('mode').value,
     brightness:+el('brightness').value,
@@ -824,6 +1025,7 @@ function gather(){
     colorD:to24(el('colorD').value),
     paletteCount:+el('paletteCount').value,
     count:[+el('c0').value,+el('c1').value,+el('c2').value,+el('c3').value],
+    reverse:reverse, // NEW: per-channel direction
     resumeOnBoot:(el('resume').value==='true'),
     enableCpu:el('smbusCpu').checked,
     enableFan:el('smbusFan').checked
@@ -883,14 +1085,9 @@ bind('paletteCount', () => {
 });
 
 // Live preview for the rest
-['brightness','speed','intensity','width','colorA','colorB','colorC','colorD','resume','smbusCpu','smbusFan']
+['brightness','speed','intensity','width','colorA','colorB','colorC','colorD','resume','smbusCpu','smbusFan',
+ 'rev0','rev1','rev2','rev3','c0','c1','c2','c3']
   .forEach(id => bind(id, preview));
-
-// Count inputs preview on change
-for (let i = 0; i < 4; i++) {
-  const n = document.getElementById('c' + i);
-  if (n) n.addEventListener('change', preview);
-}
 
 // Buttons
 document.getElementById('save').addEventListener('click',save);
@@ -1030,6 +1227,8 @@ void loop() {
     msPrev = now;
     ++tick;
     renderFrame();
+
+    RGBCtrlUDP::processPending(1500);
   }
 }
 

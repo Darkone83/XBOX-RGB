@@ -1,21 +1,21 @@
 # xboxrgb_sim.py
-# XBOX RGB Simulator – acts like the real hardware over UDP.
+# XBOX RGB Simulator – updated for RGBCtrl v1.5.x (per-channel Reverse + buildVersion)
 # Layout:
 #   CH1 = Front  (BOTTOM edge)
 #   CH2 = Left   (LEFT edge)
 #   CH3 = Rear   (TOP edge)
 #   CH4 = Right  (RIGHT edge)
-# Ring order (index progression) preserved: CH1 -> CH2 -> CH3 -> CH4.
+# Ring order: CH1 -> CH2 -> CH3 -> CH4 (indices follow a continuous loop).
 #
 # Protocol:
-#   Broadcast discover probes received as:
-#     - JSON {"op":"discover"}  → reply JSON {"op":"discover", "ip", "port", "name", "ver", "mac"}
+#   Broadcast discover probes:
+#     - JSON {"op":"discover"}  → reply JSON {"op":"discover", "ip","port","name","ver","mac"}
 #     - Text "RGBDISC?"         → reply "RGBDISC! {JSON...}"
 #   UDP ops:
-#     - {"op":"get"}            → reply {"ok":true,"op":"get","cfg":{...}}
-#     - {"op":"preview","cfg":...}  (no reply; applies live)
-#     - {"op":"save","cfg":...}     (no reply; applies live)
-#     - {"op":"reset"}               → reply {"ok":true,"op":"reset"} and reset defaults
+#     - {"op":"get"}                    → reply {"ok":true,"op":"get","cfg":{...}}
+#     - {"op":"preview","cfg":{...}}    → apply live (no reply)
+#     - {"op":"save","cfg":{...}}       → apply live (no reply)
+#     - {"op":"reset"}                  → reply {"ok":true,"op":"reset"} and reset defaults
 #
 # Requires: PySide6  (pip install PySide6)
 
@@ -27,8 +27,9 @@ from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
 
 UDP_PORT  = 7777
 NAME      = "XBOX RGB"
-VER       = "1.4.sim"
+VER       = "1.5.sim"
 COPYRIGHT = "© Darkone Customs 2025"
+BUILD_VERSION = "1.5.1 Beta"
 
 def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
 
@@ -90,7 +91,7 @@ class RGBSim(QWidget):
         self.sock.bind(("0.0.0.0", UDP_PORT))
         self.sock.setblocking(False)
 
-        # default config mirrors firmware
+        # default config mirrors firmware (incl. reverse flags)
         self.cfg = {
             "count": [8,12,12,12],       # CH1,CH2,CH3,CH4
             "brightness": 180,
@@ -106,7 +107,9 @@ class RGBSim(QWidget):
             "resumeOnBoot": True,
             "enableCpu": True,
             "enableFan": True,
+            "reverse": [True, False, False, True],  # matches RGBCtrl default REVERSE
             "copyright": COPYRIGHT,
+            "buildVersion": BUILD_VERSION,
         }
         self.apply_cfg(self.cfg, initial=True)
 
@@ -157,13 +160,15 @@ class RGBSim(QWidget):
                     "brightness":180,"mode":4,"speed":128,
                     "intensity":128,"width":4,
                     "colorA":0xFF0000,"colorB":0xFFA000,"colorC":0x00FF00,"colorD":0x0000FF,
-                    "paletteCount":2,"resumeOnBoot":True,"enableFan":True,"enableCpu":True
+                    "paletteCount":2,"resumeOnBoot":True,"enableFan":True,"enableCpu":True,
+                    "reverse":[True,False,False,True]
                 })
                 self.sock.sendto(json.dumps({"ok":True,"op":"reset"}).encode("utf-8"), addr)
 
     def current_cfg_for_reply(self):
         c = dict(self.cfg)
         c["copyright"] = COPYRIGHT
+        c["buildVersion"] = BUILD_VERSION
         return c
 
     # ---------- Config / animation ----------
@@ -179,6 +184,14 @@ class RGBSim(QWidget):
                   "colorA","colorB","colorC","colorD","paletteCount",
                   "resumeOnBoot","enableCpu","enableFan"):
             if k in cfg: c[k] = cfg[k]
+
+        # NEW: per-channel reverse
+        if "reverse" in cfg and isinstance(cfg["reverse"], (list,tuple)) and len(cfg["reverse"])>=4:
+            c["reverse"] = [bool(cfg["reverse"][i]) for i in range(4)]
+            self.canvas.set_reverse(c["reverse"])
+
+        # Meta (optional)
+        if "buildVersion" in cfg: c["buildVersion"] = cfg["buildVersion"]
 
         spd = clamp(int(c["speed"]),0,255)
         self.canvas.frame_ms = max(10, 10 + (255 - spd)//2)
@@ -198,6 +211,7 @@ class Canvas(QWidget):
         super().__init__()
         self.setMinimumSize(900, 420)
         self.counts = [8,12,12,12]   # CH1,CH2,CH3,CH4
+        self.reverse = [True, False, False, True]  # match device defaults
         self.points: List[QPointF] = []
         self.ring_len = sum(self.counts)
         self.pix = [(0,0,0)] * self.ring_len
@@ -221,6 +235,10 @@ class Canvas(QWidget):
         self.rebuild_points()
         self.update()
 
+    def set_reverse(self, rev_flags):
+        self.reverse = [bool(rev_flags[0]), bool(rev_flags[1]), bool(rev_flags[2]), bool(rev_flags[3])]
+        self.update()
+
     def sizeHint(self): return self.minimumSize()
 
     def _rect_and_metrics(self):
@@ -242,20 +260,20 @@ class Canvas(QWidget):
 
         c1, c2, c3, c4 = self.counts  # CH1,CH2,CH3,CH4
 
-        # Ring order: CH1 -> CH2 -> CH3 -> CH4
-        # CH1 = Front (BOTTOM), travel RIGHT->LEFT so it ends at bottom-left
+        # Canonical ring path (clockwise, continuous):
+        # CH1 = bottom RIGHT->LEFT
         xs = centers(xL+edge_pad, xR-edge_pad, c1)[::-1]
         for x in xs: self.points.append(QPointF(x, yB))
 
-        # CH2 = Left, travel BOTTOM->TOP
+        # CH2 = left  BOTTOM->TOP
         ys = centers(yT+edge_pad, yB-edge_pad, c2)[::-1]
         for y in ys: self.points.append(QPointF(xL, y))
 
-        # CH3 = Rear (TOP), travel LEFT->RIGHT
+        # CH3 = top   LEFT->RIGHT
         xs = centers(xL+edge_pad, xR-edge_pad, c3)
         for x in xs: self.points.append(QPointF(x, yT))
 
-        # CH4 = Right, travel TOP->BOTTOM
+        # CH4 = right TOP->BOTTOM
         ys = centers(yT+edge_pad, yB-edge_pad, c4)
         for y in ys: self.points.append(QPointF(xR, y))
 
@@ -355,11 +373,13 @@ class Canvas(QWidget):
             for w in range(span): self.pix[(pos+w)%L]=(fgr,fgg,fgb)
 
         elif self.mode == 10:  # Plasma
+            out = []
             for i in range(L):
                 a = (i/L)*math.tau
                 v = 0.5 + 0.5*(math.sin(3*a + t*0.08)*0.5 + math.sin(5*a - t*0.05)*0.5)
                 hue = (v*0.7 + (t*0.01)) % 1.0
-                self.pix[i] = hsv2rgb(hue, 0.9, 1.0)
+                out.append(hsv2rgb(hue, 0.9, 1.0))
+            self.pix = out
 
         elif self.mode == 11:  # Fire (rough)
             fade = 0.86
@@ -432,15 +452,33 @@ class Canvas(QWidget):
         qp.drawText(QRectF(-60, -10, 120, 20), Qt.AlignCenter, "Right (CH4)")
         qp.restore()
 
-        # LEDs (constant radius everywhere)
+        # LEDs with per-channel reverse mapping:
+        # points[] is in ring order; pix[] holds ring colors.
+        # For each channel, if reverse[ch] is True, we draw pixel k at position k
+        # using color from index (count-1-k) within that channel — this mirrors
+        # the firmware's setRing() behavior with REVERSE[].
         if len(self.points) != self.ring_len:
             self.rebuild_points()
+
         qp.setPen(QPen(QColor(0,0,0,140), 1))
-        for i,p in enumerate(self.points):
-            if i >= len(self.pix): break
-            r,g,b = self.pix[i]
-            qp.setBrush(QBrush(QColor(r,g,b)))
-            qp.drawEllipse(p, dot_radius, dot_radius)
+
+        offs = [0,
+                self.counts[0],
+                self.counts[0] + self.counts[1],
+                self.counts[0] + self.counts[1] + self.counts[2]]
+
+        for ch in range(4):
+            cnt = self.counts[ch]
+            base = offs[ch]
+            rev = self.reverse[ch]
+            for k in range(cnt):
+                point_idx = base + k
+                src_idx   = base + (cnt - 1 - k) if rev else (base + k)
+                if point_idx >= len(self.points) or src_idx >= len(self.pix): break
+                p = self.points[point_idx]
+                r,g,b = self.pix[src_idx]
+                qp.setBrush(QBrush(QColor(r,g,b)))
+                qp.drawEllipse(p, dot_radius, dot_radius)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)

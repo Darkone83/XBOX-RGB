@@ -1,7 +1,7 @@
 # rgbctrl_desktop.py
-# XBOX RGB Control – Desktop controller for RGBCtrl firmware (v1.4.x)
+# XBOX RGB Control – Desktop controller for RGBCtrl firmware (v1.5.x)
 # - Auto-discovers devices via UDP broadcast
-# - Mirrors Web UI controls 1:1
+# - Mirrors Web UI controls 1:1 (incl. per-channel Reverse)
 # - UDP preview/save/reset/get + HTTP fallback to /config/api/*
 # - Live preview with debounce on change
 #
@@ -68,7 +68,9 @@ def default_cfg():
         "paletteCount": 2,
         "resumeOnBoot": True,
         "enableCpu": True,
-        "enableFan": True
+        "enableFan": True,
+        # Mirror firmware compile-time defaults (Front & Right reversed)
+        "reverse": [True, False, False, True],
     }
 
 # ------------------- Utilities ----------------------------
@@ -413,6 +415,19 @@ class MainWindow(QWidget):
         self.c0 = QSpinBox(); self.c1 = QSpinBox(); self.c2 = QSpinBox(); self.c3 = QSpinBox()
         for s in (self.c0,self.c1,self.c2,self.c3): s.setRange(0,50)
 
+        # NEW: per-channel reverse toggles
+        self.rev0 = QCheckBox("Reverse CH1 (Front)")
+        self.rev1 = QCheckBox("Reverse CH2 (Left)")
+        self.rev2 = QCheckBox("Reverse CH3 (Rear)")
+        self.rev3 = QCheckBox("Reverse CH4 (Right)")
+        revBox = QGroupBox("Channel Direction")
+        revL = QVBoxLayout()
+        revL.addWidget(self.rev0)
+        revL.addWidget(self.rev1)
+        revL.addWidget(self.rev2)
+        revL.addWidget(self.rev3)
+        revBox.setLayout(revL)
+
         self.resume = QComboBox(); self.resume.addItems(["No","Yes"])
         self.smbusCpu = QCheckBox("Enable CPU temp LEDs (CH5)")
         self.smbusFan = QCheckBox("Enable Fan speed LEDs (CH6)")
@@ -448,6 +463,9 @@ class MainWindow(QWidget):
         g.addWidget(QLabel("CH3 (Rear) Count"),  r,0); g.addWidget(self.c2, r,1,1,2); r+=1
         g.addWidget(QLabel("CH4 (Right) Count"), r,0); g.addWidget(self.c3, r,1,1,2); r+=1
 
+        # Insert Reverse group
+        g.addWidget(revBox, r,0,1,3); r+=1
+
         g.addWidget(QLabel("Resume last mode on boot"), r,0); g.addWidget(self.resume, r,1,1,2); r+=1
         g.addWidget(self.smbusCpu, r,0,1,3); r+=1
         g.addWidget(self.smbusFan, r,0,1,3); r+=1
@@ -460,7 +478,7 @@ class MainWindow(QWidget):
 
         ctrl.setLayout(g)
 
-        # Footer (copyright only)
+        # Footer (copyright / version if provided)
         self.footer = QLabel("© Darkone Customs 2025")
         self.footer.setAlignment(Qt.AlignCenter)
 
@@ -487,6 +505,10 @@ class MainWindow(QWidget):
             s.valueChanged.connect(self._value_changed)
         for s in (self.c0,self.c1,self.c2,self.c3):
             s.valueChanged.connect(self._value_changed)
+
+        # New reverse toggles
+        for cb in (self.rev0, self.rev1, self.rev2, self.rev3):
+            cb.stateChanged.connect(self._value_changed)
 
         self.paletteCount.currentIndexChanged.connect(self._palette_changed)
         self.resume.currentIndexChanged.connect(self._value_changed)
@@ -585,7 +607,12 @@ class MainWindow(QWidget):
             m = cfg.get("mode", 4)
             if not isinstance(m, int) or m < 0 or m > 13:
                 cfg["mode"] = 4  # Rainbow default
-            self.footer.setText(cfg.get("copyright", "© Darkone Customs 2025"))
+
+            # footer text (copyright + version if provided)
+            cpy = cfg.get("copyright", "© Darkone Customs 2025")
+            ver = cfg.get("buildVersion")
+            self.footer.setText(f"{cpy}" + (f"  •  v{ver}" if ver else ""))
+
             self._cfg_to_ui(cfg)
             self.status.setText("status: ready")
         except Exception as e:
@@ -646,6 +673,13 @@ class MainWindow(QWidget):
         self.c2.setValue(clamp(c[2],0,50))
         self.c3.setValue(clamp(c[3],0,50))
 
+        # NEW: reverse flags (fallback to defaults if missing)
+        rev = cfg.get("reverse", default_cfg()["reverse"])
+        self.rev0.setChecked(bool(rev[0] if len(rev)>0 else False))
+        self.rev1.setChecked(bool(rev[1] if len(rev)>1 else False))
+        self.rev2.setChecked(bool(rev[2] if len(rev)>2 else False))
+        self.rev3.setChecked(bool(rev[3] if len(rev)>3 else False))
+
         self.resume.setCurrentIndex(1 if cfg.get("resumeOnBoot",True) else 0)
         self.smbusCpu.setChecked(bool(cfg.get("enableCpu",True)))
         self.smbusFan.setChecked(bool(cfg.get("enableFan",True)))
@@ -665,7 +699,13 @@ class MainWindow(QWidget):
             "colorB": self.colorB.value(),
             "colorC": self.colorC.value(),
             "colorD": self.colorD.value(),
-            "paletteCount": self.paletteCount.currentData(),
+            "paletteCount": self.paletteCount.currentData() or (self.paletteCount.currentIndex()+1),
+            "reverse": [
+                self.rev0.isChecked(),
+                self.rev1.isChecked(),
+                self.rev2.isChecked(),
+                self.rev3.isChecked(),
+            ],
             "resumeOnBoot": (self.resume.currentIndex()==1),
             "enableCpu": self.smbusCpu.isChecked(),
             "enableFan": self.smbusFan.isChecked()
@@ -704,7 +744,7 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setWindowIcon(QIcon(ICON_PATH))
     w = MainWindow()
-    w.resize(780, 780)
+    w.resize(780, 850)
     w.show()
     sys.exit(app.exec())
 
