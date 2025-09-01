@@ -74,6 +74,7 @@ static bool gEnableCPU   = true;
 static bool gEnableFAN   = true;
 
 static bool gIsXcalibur  = false;
+static bool gBoardDetected = false;  // defer probing until safe (and only once)
 
 // track last applied brightness
 static uint8_t lastAppliedBrightnessCpu = 0xFF;
@@ -238,8 +239,14 @@ static bool probeI2C(uint8_t addr7) {
   uint8_t err = Wire.endTransmission();
   return (err == 0);
 }
-static void detectBoard() {
-  gIsXcalibur = probeI2C(I2C_XCALIBUR);
+
+// Lazy/guarded board probe: only when Type-D NOT present, and only once.
+static void detectBoardLazy() {
+  if (gBoardDetected) return;
+  if (typeDPresent()) return;               // strict: no SMBus while Type-D is around
+  RGBCtrlUDP::enterSmbusQuietUs(1500);      // keep consistent with other SMBus ops
+  gIsXcalibur = probeI2C(I2C_XCALIBUR);     // single, quick probe
+  gBoardDetected = true;
 }
 
 // ---------- internal ----------
@@ -275,8 +282,7 @@ void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
   Wire.setTimeOut(20);      // keep bus stalls short to avoid UI hiccups
 #endif
 
-  detectBoard();
-
+  // Do not probe SMBus here; we’ll detect lazily only when safe.
   lastPoll = 0;
   smoothedCpu = 0.f; smoothedFan = 0.f;
 
@@ -304,6 +310,9 @@ static void updateOnce() {
     if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
   }
+
+  // We’re about to talk SMBus (at least one metric enabled, no Type-D): probe once, safely.
+  detectBoardLazy();
 
   // Wrap the whole poll with a coarse quiet window as a belt-and-suspenders.
   // Subsequent per-attempt guards will extend this if needed.

@@ -11,7 +11,7 @@
 namespace WiFiMgr { AsyncWebServer& getServer(); }
 
 // -------------------- Build / Branding --------------------
-static const char* APP_VERSION = "1.5.2"; // shown in footer
+static const char* APP_VERSION = "1.5.3"; // shown in footer
 static const char* COPYRIGHT_TXT = "© Darkone Customs 2025";
 
 // -------------------- Limits / Types --------------------

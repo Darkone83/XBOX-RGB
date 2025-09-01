@@ -5,6 +5,7 @@
 #include <DNSServer.h>
 #include "led_stat.h"
 #include <vector>
+#include <algorithm>
 #include "esp_wifi.h"
 #include <Update.h>  // OTA
 
@@ -25,6 +26,9 @@ static int connectAttempts = 0;
 static const int maxAttempts = 10;
 static unsigned long lastAttempt = 0;
 static unsigned long retryDelay = 3000;
+
+// Ensure portal routes are only added once (so we don't need server.reset()).
+static bool portalRoutesAdded = false;
 
 AsyncWebServer& getServer() {
   return server;
@@ -61,24 +65,9 @@ static void setAPConfig() {
   );
 }
 
-static void startPortal() {
-  WiFi.disconnect(true);
-  delay(100);
-  setAPConfig();
-  WiFi.mode(WIFI_AP_STA);  // AP+STA so scan works while in portal
-  delay(100);
-
-  // Channel 6 for iOS compatibility
-  bool apok = WiFi.softAP("XBOX RGB Setup", "", 6, 0);
-  esp_wifi_set_max_tx_power(20);
-  LedStat::setStatus(LedStatus::Portal);
-  Serial.printf("[WiFiMgr] softAP=%d, IP: %s\n", apok, WiFi.softAPIP().toString().c_str());
-  delay(200);
-
-  IPAddress apIP = WiFi.softAPIP();
-  dnsServer.start(53, "*", apIP);
-
-  server.reset(); // avoid double route registration when restarting portal
+static void addPortalRoutesOnce() {
+  if (portalRoutesAdded) return;
+  portalRoutesAdded = true;
 
   // ---------- Portal UI ----------
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -96,6 +85,7 @@ static void startPortal() {
     .btn-primary {background:#299a2c;border:0;color:white}
     .btn-danger {background:#a22;border:0;color:white}
     .btn-ota {background:#265aa5;border:0;color:white}
+    .btn-config {background:#7a3ef0;border:0;color:white}
     .row {display:grid;grid-template-columns:1fr;gap:.6em}
     .status {margin-top:8px;opacity:.85}
   </style>
@@ -114,6 +104,7 @@ static void startPortal() {
       <button type="button" onclick="save()" class="btn-primary">Connect & Save</button>
       <button type="button" onclick="forget()" class="btn-danger">Forget WiFi</button>
       <button type="button" onclick="window.location='/ota'" class="btn-ota">OTA Update</button>
+      <button type="button" onclick="window.location='/config'" class="btn-config">Config</button>
       <div class="status" id="status">Status: ...</div>
     </div>
   </div>
@@ -171,8 +162,7 @@ static void startPortal() {
   // ---------- OTA PAGE (simple & robust) ----------
   server.on("/ota", HTTP_GET, [](AsyncWebServerRequest *request){
     static const char kPage[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html><head><meta charset="utf-8">
+<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OTA Update</title>
 <style>
@@ -189,6 +179,7 @@ static void startPortal() {
     <button type="submit">Upload & Flash</button>
   </form>
   <a href="/">⟵ Back to WiFi Setup</a>
+  <a href="/config">Open Config</a>
 </div></body></html>
 )HTML";
     request->send(200, "text/html", kPage);
@@ -252,7 +243,7 @@ static void startPortal() {
     request->send(200, "text/plain", stat);
   });
 
-  // ---------- Connect (GET, used by some captive flows) ----------
+  // ---------- Connect (GET) ----------
   server.on("/connect", HTTP_GET, [](AsyncWebServerRequest *request){
     String ss, pw;
     if (request->hasParam("ssid")) ss = request->getParam("ssid")->value();
@@ -299,20 +290,52 @@ static void startPortal() {
     }
   );
 
-  // ---------- Scan: return names only (array of strings) ----------
+  // ---------- Scan: return de-duped, RSSI-sorted names ----------
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
     int n = WiFi.scanComplete();
+
+    // Start async scan if not running yet
     if (n == -2) {
-      // Not running → start async scan and return cached list
+      // async=true, show_hidden=true (passive=false keeps it quick)
       WiFi.scanNetworks(true, true);
     }
-    String json = "[";
+
     if (n >= 0) {
+      struct Net { String name; int32_t rssi; };
+      std::vector<Net> nets;
+      nets.reserve(n);
+
+      // Build unique set by SSID, keep strongest RSSI
+      for (int i = 0; i < n; ++i) {
+        String name = WiFi.SSID(i);
+        if (!name.length()) continue; // ignore hidden/empty SSIDs
+        int32_t rssi = WiFi.RSSI(i);
+
+        bool merged = false;
+        for (auto &it : nets) {
+          if (it.name == name) {
+            if (rssi > it.rssi) it.rssi = rssi;
+            merged = true;
+            break;
+          }
+        }
+        if (!merged) nets.push_back({name, rssi});
+      }
+
+      // sort by strongest first
+      std::sort(nets.begin(), nets.end(), [](const Net& a, const Net& b){ return a.rssi > b.rssi; });
+
       lastScanResults.clear();
-      for (int i = 0; i < n; ++i) lastScanResults.push_back(WiFi.SSID(i));
+      lastScanResults.reserve(nets.size());
+      for (auto &it : nets) lastScanResults.push_back(it.name);
+
       WiFi.scanDelete();
+      // Immediately kick off a new async scan so results stay fresh
+      WiFi.scanNetworks(true, true);
     }
+
     // Return cached (or just-updated) names only
+    String json = "[";
     for (size_t i=0; i<lastScanResults.size(); ++i) {
       if (i) json += ",";
       json += "\"" + lastScanResults[i] + "\"";
@@ -343,6 +366,27 @@ static void startPortal() {
 
   // No caching for UI/API
   DefaultHeaders::Instance().addHeader("Cache-Control", "no-store");
+}
+
+static void startPortal() {
+  WiFi.disconnect(true);
+  delay(100);
+  setAPConfig();
+  WiFi.mode(WIFI_AP_STA);  // AP+STA so scan works while in portal
+  delay(100);
+
+  // Channel 6 for iOS compatibility
+  bool apok = WiFi.softAP("XBOX RGB Setup", "", 6, 0);
+  esp_wifi_set_max_tx_power(20);
+  LedStat::setStatus(LedStatus::Portal);
+  Serial.printf("[WiFiMgr] softAP=%d, IP: %s\n", apok, WiFi.softAPIP().toString().c_str());
+  delay(200);
+
+  IPAddress apIP = WiFi.softAPIP();
+  dnsServer.start(53, "*", apIP);
+
+  // Do NOT reset the server: keep previously-registered routes (like /config) live in AP mode.
+  addPortalRoutesOnce();
 
   server.begin();
   state = State::PORTAL;
