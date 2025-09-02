@@ -25,6 +25,8 @@ The web UI previews changes live and saves them to flash (NVS).
 - 🔆 Global **brightness** (1–255)
 - ⚙️ Per-mode controls: **Speed**, **Intensity**, **Width/Gap**, **Color A / Color B**
 - 🧭 **Sane orientation & sync**: effects start at **CH1 (Front)** and flow clockwise **CH1→CH2→CH3→CH4**; all “phase” effects are synchronized
+- 🪩 **Adjustable Strip length** CH1 - 4 can support up to 50 LEDs configurable from the webui
+- 🔀 **Reversible channel support** Adjust the direction of your channels if you installed them backwards
 - 💾 **Persistent settings** in NVS (counts, mode, colors, brightness, toggles…)
 - 📶 **Wi-Fi portal** (AP SSID `XBOX RGB Setup`) with a sticky SSID picker
 - 🌐 **Web UI** at `/config`
