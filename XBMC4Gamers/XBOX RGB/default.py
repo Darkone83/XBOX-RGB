@@ -24,6 +24,7 @@ MODES = [
     (4, 'Rainbow'), (5, 'Theater Chase'), (6, 'Twinkle'), (7, 'Comet'),
     (8, 'Meteor'), (9, 'Clock Spin'), (10, 'Plasma'), (11, 'Fire / Flicker'),
     (12, 'Palette Cycle'), (13, 'Palette Chase'),
+    (14, 'Custom (Playlist)'),
 ]
 MODE_VALUES = [v for v,_ in MODES]
 MODE_NAMES  = [n for _,n in MODES]
@@ -66,6 +67,10 @@ DEFAULT_CFG = {
     'enableCpu': True,
     'enableFan': True,
     'reverse': [True, False, False, True],  # NEW
+    # v1.6 additions:
+    'masterOff': False,
+    'customLoop': True,
+    'customSeq': '[]',  # JSON array of steps; edited here (power users) or via WebUI builder
 }
 
 # -------------------- helpers (ASCII-safe) --------------------
@@ -291,6 +296,10 @@ class App(object):
             if not (isinstance(rv, list) and len(rv) >= 4):
                 # default to firmware's compiled defaults if missing
                 self.cfg['reverse'] = [True, False, False, True]
+            # ensure new keys exist if device is older
+            if 'masterOff'   not in self.cfg: self.cfg['masterOff'] = False
+            if 'customLoop'  not in self.cfg: self.cfg['customLoop'] = True
+            if 'customSeq'   not in self.cfg: self.cfg['customSeq']  = '[]'
         else:
             _notify('XBOX RGB', 'Could not fetch config; using defaults')
         return True
@@ -374,6 +383,34 @@ class App(object):
         _notify('XBOX RGB', 'Reverse CH%d: %s' % (ch_index+1, 'On' if rv[ch_index] else 'Off'))
         self.preview()
 
+    # ---- new: master off / custom playlist ----
+    def toggle_master_off(self):
+        self.cfg['masterOff'] = not bool(self.cfg.get('masterOff', False))
+        _notify('XBOX RGB', 'Master Off: %s' % ('On' if self.cfg['masterOff'] else 'Off'))
+        self.preview()
+
+    def toggle_custom_loop(self):
+        self.cfg['customLoop'] = not bool(self.cfg.get('customLoop', True))
+        _notify('XBOX RGB', 'Custom Loop: %s' % ('On' if self.cfg['customLoop'] else 'Off'))
+        # keep mode as-is; preview to reflect new loop flag (if already in custom)
+        self.preview()
+
+    def edit_custom_seq(self):
+        """
+        Edit customSeq JSON (advanced). For friendly editing, use the device WebUI builder,
+        but this keeps power-user control available inside XBMC as well.
+        """
+        cur = self.cfg.get('customSeq') or '[]'
+        txt = dlg_input('customSeq JSON (see WebUI builder)', cur, xbmcgui.INPUT_ALPHANUM)
+        if txt is None or txt == '':  # cancel or blank
+            return
+        # accept as-is (device validates). Keep it ASCII-only field.
+        self.cfg['customSeq'] = txt
+        # If user intends to run it now, switch to Custom mode.
+        if int(self.cfg.get('mode', 4)) != 14:
+            self.cfg['mode'] = 14
+        self.preview()
+
     # ---- device actions ----
     def preview(self):
         if not self.dev: return
@@ -408,6 +445,10 @@ class App(object):
             # ensure reverse exists
             if not (isinstance(self.cfg.get('reverse'), list) and len(self.cfg['reverse']) >= 4):
                 self.cfg['reverse'] = [True, False, False, True]
+            # ensure new keys exist if device is older
+            if 'masterOff'   not in self.cfg: self.cfg['masterOff'] = False
+            if 'customLoop'  not in self.cfg: self.cfg['customLoop'] = True
+            if 'customSeq'   not in self.cfg: self.cfg['customSeq']  = '[]'
 
     def set_psk(self):
         psk = dlg_input('PSK', '', xbmcgui.INPUT_ALPHANUM)
@@ -434,6 +475,7 @@ class App(object):
                 'Set PSK',
                 '-----',
                 'Mode: %s' % self._mode_name(c.get('mode',0)),
+                'Master Off: %s' % ('On' if c.get('masterOff') else 'Off'),
                 'Brightness: %d' % int(c.get('brightness',128)),
                 'Speed: %d' % int(c.get('speed',128)),
                 'Intensity: %d' % int(c.get('intensity',128)),
@@ -450,6 +492,10 @@ class App(object):
                 'Reverse CH2: %s' % ('On' if rv[1] else 'Off'),
                 'Reverse CH3: %s' % ('On' if rv[2] else 'Off'),
                 'Reverse CH4: %s' % ('On' if rv[3] else 'Off'),
+                # Custom mode controls (always visible; useful to prep then switch modes)
+                '-----',
+                'Custom: Loop: %s' % ('On' if c.get('customLoop') else 'Off'),
+                'Custom: Edit playlist (JSON)',
                 '-----',
                 'Resume On Boot: %s' % ('On' if c.get('resumeOnBoot') else 'Off'),
                 'SMBus CPU: %s' % ('On' if c.get('enableCpu') else 'Off'),
@@ -469,6 +515,7 @@ class App(object):
             elif label == 'Manual IP':             self.set_manual_ip()
             elif label == 'Set PSK':               self.set_psk()
             elif label.startswith('Mode:'):        self.set_mode()
+            elif label.startswith('Master Off:'):  self.toggle_master_off()
             elif label.startswith('Brightness:'):  self.set_slider('brightness','Brightness',1,255)
             elif label.startswith('Speed:'):       self.set_slider('speed','Speed',0,255)
             elif label.startswith('Intensity:'):   self.set_slider('intensity','Intensity',0,255)
@@ -483,6 +530,8 @@ class App(object):
             elif label.startswith('Reverse CH2:'): self.toggle_reverse(1)
             elif label.startswith('Reverse CH3:'): self.toggle_reverse(2)
             elif label.startswith('Reverse CH4:'): self.toggle_reverse(3)
+            elif label.startswith('Custom: Loop:'): self.toggle_custom_loop()
+            elif label.startswith('Custom: Edit playlist'): self.edit_custom_seq()
             elif label.startswith('Resume On Boot:'): self.toggle('resumeOnBoot','Resume On Boot')
             elif label.startswith('SMBus CPU:'):      self.toggle('enableCpu','SMBus CPU')
             elif label.startswith('SMBus FAN:'):      self.toggle('enableFan','SMBus FAN')

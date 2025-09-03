@@ -1,7 +1,7 @@
 # rgbctrl_desktop.py
-# XBOX RGB Control – Desktop controller for RGBCtrl firmware (v1.5.x)
+# XBOX RGB Control – Desktop controller for RGBCtrl firmware (v1.6.x)
 # - Auto-discovers devices via UDP broadcast
-# - Mirrors Web UI controls 1:1 (incl. per-channel Reverse)
+# - Mirrors Web UI controls 1:1 (incl. per-channel Reverse, Master Off, Custom Playlist)
 # - UDP preview/save/reset/get + HTTP fallback to /config/api/*
 # - Live preview with debounce on change
 #
@@ -16,7 +16,7 @@ from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QSlider, QSpinBox, QGridLayout,
     QHBoxLayout, QVBoxLayout, QPushButton, QLineEdit, QCheckBox, QGroupBox,
-    QColorDialog, QMessageBox
+    QColorDialog, QMessageBox, QTextEdit
 )
 
 APP_NAME = "XBOX RGB Control"
@@ -40,17 +40,19 @@ MODES = [
     ("Fire / Flicker", 11),
     ("Palette Cycle", 12),
     ("Palette Chase", 13),
+    ("Custom (Playlist)", 14),   # NEW
 ]
 
 # Visibility map (same as Web UI JS showOptsFor)
 VIS = {
-    "colorA":   set(range(0,14)),
+    "colorA":   set(range(0,14)),                # 0..13
     "colorB":   {8,9,10,12,13},
     "colorC":   {12,13},
     "colorD":   {12,13},
     "palette":  {12,13},
     "width":    {3,5,7,8,9,13},
     "intensity":{3,5,6,7,8,11,12,13},
+    # For mode 14 (Custom), we show the Custom group explicitly and leave main sliders visible.
 }
 
 def default_cfg():
@@ -71,6 +73,10 @@ def default_cfg():
         "enableFan": True,
         # Mirror firmware compile-time defaults (Front & Right reversed)
         "reverse": [True, False, False, True],
+        # NEW:
+        "masterOff": False,
+        "customLoop": True,
+        "customSeq": "[]",
     }
 
 # ------------------- Utilities ----------------------------
@@ -402,6 +408,9 @@ class MainWindow(QWidget):
         self.intensityV  = QLabel("128")
         self.widthV      = QLabel("4")
 
+        # NEW: Master Off
+        self.masterOff = QCheckBox("Master Off (all channels off)")
+
         self.colorA = ColorField("Color A", 0xFF0000)
         self.colorB = ColorField("Color B", 0xFFA000)
         self.colorC = ColorField("Color C", 0x00FF00)
@@ -432,12 +441,26 @@ class MainWindow(QWidget):
         self.smbusCpu = QCheckBox("Enable CPU temp LEDs (CH5)")
         self.smbusFan = QCheckBox("Enable Fan speed LEDs (CH6)")
 
+        # NEW: Custom Playlist group
+        self.customGroup = QGroupBox("Custom Playlist")
+        cgL = QGridLayout()
+        self.customLoop = QCheckBox("Loop playlist")
+        self.customLoop.setChecked(True)
+        self.customSeq = QTextEdit()
+        self.customSeq.setPlaceholderText('[ {"mode":0,"duration":1000,"colorA":16711680}, {"mode":7,"duration":1200,"speed":200} ]')
+        cgL.addWidget(self.customLoop, 0,0,1,3)
+        cgL.addWidget(QLabel("Steps JSON"), 1,0)
+        cgL.addWidget(self.customSeq, 1,1,1,2)
+        self.customGroup.setLayout(cgL)
+
         self.previewBtn = QPushButton("Preview")
         self.saveBtn    = QPushButton("Save")
         self.resetBtn   = QPushButton("Reset Defaults")
 
         r = 0
         g.addWidget(QLabel("Mode"), r,0); g.addWidget(self.mode, r,1,1,2); r+=1
+
+        g.addWidget(self.masterOff, r,0,1,3); r+=1  # NEW
 
         g.addWidget(self.lblBrightness, r,0)
         g.addWidget(self.brightness, r,1); g.addWidget(self.brightnessV, r,2); r+=1
@@ -465,6 +488,9 @@ class MainWindow(QWidget):
 
         # Insert Reverse group
         g.addWidget(revBox, r,0,1,3); r+=1
+
+        # NEW: Custom Playlist group (visible when mode==14)
+        g.addWidget(self.customGroup, r,0,1,3); r+=1
 
         g.addWidget(QLabel("Resume last mode on boot"), r,0); g.addWidget(self.resume, r,1,1,2); r+=1
         g.addWidget(self.smbusCpu, r,0,1,3); r+=1
@@ -506,14 +532,18 @@ class MainWindow(QWidget):
         for s in (self.c0,self.c1,self.c2,self.c3):
             s.valueChanged.connect(self._value_changed)
 
-        # New reverse toggles
-        for cb in (self.rev0, self.rev1, self.rev2, self.rev3):
+        # New toggles
+        for cb in (self.rev0, self.rev1, self.rev2, self.rev3, self.masterOff):
             cb.stateChanged.connect(self._value_changed)
 
         self.paletteCount.currentIndexChanged.connect(self._palette_changed)
         self.resume.currentIndexChanged.connect(self._value_changed)
         self.smbusCpu.stateChanged.connect(self._value_changed)
         self.smbusFan.stateChanged.connect(self._value_changed)
+
+        # Custom playlist changes
+        self.customLoop.stateChanged.connect(self._value_changed)
+        self.customSeq.textChanged.connect(self._value_changed)
 
         self.previewBtn.clicked.connect(self._send_preview)
         self.saveBtn.clicked.connect(self._send_save)
@@ -605,7 +635,7 @@ class MainWindow(QWidget):
         try:
             cfg = self.transport.get_config()
             m = cfg.get("mode", 4)
-            if not isinstance(m, int) or m < 0 or m > 13:
+            if not isinstance(m, int) or m < 0 or m > 14:
                 cfg["mode"] = 4  # Rainbow default
 
             # footer text (copyright + version if provided)
@@ -646,48 +676,69 @@ class MainWindow(QWidget):
 
     # --------------- Mapping UI <-> JSON ------------------
     def _cfg_to_ui(self, cfg):
-        self.cfg = cfg
-        desired = cfg.get("mode", 4)
+        self.cfg = {**default_cfg(), **cfg}  # ensure new keys exist
+
+        desired = self.cfg.get("mode", 4)
         idx = 0
         for i,(name,val) in enumerate(MODES):
             if val == desired: idx=i; break
         self.mode.setCurrentIndex(idx)
 
-        self.brightness.setValue(clamp(cfg.get("brightness",180),1,255))
-        self.speed.setValue(clamp(cfg.get("speed",128),0,255))
-        self.intensity.setValue(clamp(cfg.get("intensity",128),0,255))
-        self.width.setValue(clamp(cfg.get("width",4),1,20))
+        self.masterOff.setChecked(bool(self.cfg.get("masterOff", False)))
+
+        self.brightness.setValue(clamp(self.cfg.get("brightness",180),1,255))
+        self.speed.setValue(clamp(self.cfg.get("speed",128),0,255))
+        self.intensity.setValue(clamp(self.cfg.get("intensity",128),0,255))
+        self.width.setValue(clamp(self.cfg.get("width",4),1,20))
         self._slider_label_sync()
 
-        self.colorA.set_value(cfg.get("colorA",0))
-        self.colorB.set_value(cfg.get("colorB",0))
-        self.colorC.set_value(cfg.get("colorC",0))
-        self.colorD.set_value(cfg.get("colorD",0))
+        self.colorA.set_value(self.cfg.get("colorA",0))
+        self.colorB.set_value(self.cfg.get("colorB",0))
+        self.colorC.set_value(self.cfg.get("colorC",0))
+        self.colorD.set_value(self.cfg.get("colorD",0))
 
-        pc = clamp(cfg.get("paletteCount",2),1,4)
+        pc = clamp(self.cfg.get("paletteCount",2),1,4)
         self.paletteCount.setCurrentIndex(pc-1)
 
-        c = cfg.get("count",[50,50,50,50]) + [50,50,50,50]
+        c = self.cfg.get("count",[50,50,50,50]) + [50,50,50,50]
         self.c0.setValue(clamp(c[0],0,50))
         self.c1.setValue(clamp(c[1],0,50))
         self.c2.setValue(clamp(c[2],0,50))
         self.c3.setValue(clamp(c[3],0,50))
 
-        # NEW: reverse flags (fallback to defaults if missing)
-        rev = cfg.get("reverse", default_cfg()["reverse"])
+        # reverse flags (fallback to defaults if missing)
+        rev = self.cfg.get("reverse", default_cfg()["reverse"])
         self.rev0.setChecked(bool(rev[0] if len(rev)>0 else False))
         self.rev1.setChecked(bool(rev[1] if len(rev)>1 else False))
         self.rev2.setChecked(bool(rev[2] if len(rev)>2 else False))
         self.rev3.setChecked(bool(rev[3] if len(rev)>3 else False))
 
-        self.resume.setCurrentIndex(1 if cfg.get("resumeOnBoot",True) else 0)
-        self.smbusCpu.setChecked(bool(cfg.get("enableCpu",True)))
-        self.smbusFan.setChecked(bool(cfg.get("enableFan",True)))
+        self.resume.setCurrentIndex(1 if self.cfg.get("resumeOnBoot",True) else 0)
+        self.smbusCpu.setChecked(bool(self.cfg.get("enableCpu",True)))
+        self.smbusFan.setChecked(bool(self.cfg.get("enableFan",True)))
+
+        # Custom playlist
+        self.customLoop.setChecked(bool(self.cfg.get("customLoop", True)))
+        try:
+            # Pretty print if valid; otherwise leave as-is
+            seq = self.cfg.get("customSeq", "[]")
+            steps = json.loads(seq) if isinstance(seq, str) else seq
+            self.customSeq.setPlainText(json.dumps(steps, indent=2))
+        except Exception:
+            self.customSeq.setPlainText(self.cfg.get("customSeq", "[]"))
 
         self._update_visibility()
 
     def _ui_to_cfg(self):
         mval = MODES[self.mode.currentIndex()][1]
+        # Try to keep customSeq valid JSON; on error, fall back to "[]"
+        seq_txt = self.customSeq.toPlainText().strip()
+        try:
+            _parsed = json.loads(seq_txt)  # validate
+            seq_out = json.dumps(_parsed)  # compact
+        except Exception:
+            seq_out = "[]"
+
         cfg = {
             "count": [self.c0.value(), self.c1.value(), self.c2.value(), self.c3.value()],
             "brightness": self.brightness.value(),
@@ -708,7 +759,11 @@ class MainWindow(QWidget):
             ],
             "resumeOnBoot": (self.resume.currentIndex()==1),
             "enableCpu": self.smbusCpu.isChecked(),
-            "enableFan": self.smbusFan.isChecked()
+            "enableFan": self.smbusFan.isChecked(),
+            # NEW:
+            "masterOff": self.masterOff.isChecked(),
+            "customLoop": self.customLoop.isChecked(),
+            "customSeq": seq_out,
         }
         return cfg
 
@@ -728,9 +783,9 @@ class MainWindow(QWidget):
         self.widthV.setVisible(use_w)
 
         # Colors / palette
-        self.colorA.setVisible(vis("colorA"))
-        self.colorB.setVisible(vis("colorB"))
-        palActive = vis("palette")
+        self.colorA.setVisible(mode != 14 and vis("colorA"))   # in Custom, colors are per-step; but keep visible if you want globals
+        self.colorB.setVisible(mode != 14 and vis("colorB"))
+        palActive = (mode != 14 and vis("palette"))
         self.lblPalette.setVisible(palActive)
         self.paletteCount.setVisible(palActive)
 
@@ -738,13 +793,16 @@ class MainWindow(QWidget):
         self.colorC.setVisible(palActive and pc >= 3 and vis("colorC"))
         self.colorD.setVisible(palActive and pc >= 4 and vis("colorD"))
 
+        # Custom group visibility
+        self.customGroup.setVisible(mode == 14)
+
 # ------------------- main -------------------------------
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setWindowIcon(QIcon(ICON_PATH))
     w = MainWindow()
-    w.resize(780, 850)
+    w.resize(820, 920)
     w.show()
     sys.exit(app.exec())
 

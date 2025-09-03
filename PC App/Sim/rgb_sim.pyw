@@ -1,5 +1,9 @@
 # xboxrgb_sim.py
-# XBOX RGB Simulator – updated for RGBCtrl v1.5.x (per-channel Reverse + buildVersion)
+# XBOX RGB Simulator – updated for RGBCtrl v1.6.x
+# New:
+#   - masterOff support (global blackout)
+#   - Custom (Playlist) mode = 14 with customLoop + customSeq parsing & playback
+#
 # Layout:
 #   CH1 = Front  (BOTTOM edge)
 #   CH2 = Left   (LEFT edge)
@@ -20,16 +24,16 @@
 # Requires: PySide6  (pip install PySide6)
 
 import sys, json, socket, time, math, random
-from typing import List
+from typing import List, Dict, Any
 from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
 from PySide6.QtGui  import QPainter, QColor, QPen, QBrush, QFont
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
 
 UDP_PORT  = 7777
 NAME      = "XBOX RGB"
-VER       = "1.5.sim"
+VER       = "1.6.sim"
 COPYRIGHT = "© Darkone Customs 2025"
-BUILD_VERSION = "1.5.1 Beta"
+BUILD_VERSION = "1.6.0"
 
 def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
 
@@ -92,7 +96,7 @@ class RGBSim(QWidget):
         self.sock.setblocking(False)
 
         # default config mirrors firmware (incl. reverse flags)
-        self.cfg = {
+        self.cfg: Dict[str, Any] = {
             "count": [8,12,12,12],       # CH1,CH2,CH3,CH4
             "brightness": 180,
             "mode": 4,                   # Rainbow default
@@ -108,10 +112,21 @@ class RGBSim(QWidget):
             "enableCpu": True,
             "enableFan": True,
             "reverse": [True, False, False, True],  # matches RGBCtrl default REVERSE
+            # New 1.6.x:
+            "masterOff": False,
+            "customLoop": True,
+            "customSeq": "[]",
             "copyright": COPYRIGHT,
             "buildVersion": BUILD_VERSION,
         }
         self.apply_cfg(self.cfg, initial=True)
+
+        # Custom playlist runtime state
+        self._cust_active = False
+        self._cust_seq: List[Dict[str, Any]] = []
+        self._cust_loop = True
+        self._cust_idx = 0
+        self._cust_step_started = time.time()
 
         # timers
         self.anim = QTimer(self); self.anim.timeout.connect(self.tick_anim); self.anim.start(16)
@@ -161,7 +176,10 @@ class RGBSim(QWidget):
                     "intensity":128,"width":4,
                     "colorA":0xFF0000,"colorB":0xFFA000,"colorC":0x00FF00,"colorD":0x0000FF,
                     "paletteCount":2,"resumeOnBoot":True,"enableFan":True,"enableCpu":True,
-                    "reverse":[True,False,False,True]
+                    "reverse":[True,False,False,True],
+                    "masterOff": False,
+                    "customLoop": True,
+                    "customSeq": "[]",
                 })
                 self.sock.sendto(json.dumps({"ok":True,"op":"reset"}).encode("utf-8"), addr)
 
@@ -172,7 +190,31 @@ class RGBSim(QWidget):
         return c
 
     # ---------- Config / animation ----------
+    def _parse_custom_seq(self, seq_raw) -> List[Dict[str, Any]]:
+        try:
+            if isinstance(seq_raw, str):
+                arr = json.loads(seq_raw)
+            else:
+                arr = seq_raw
+            if not isinstance(arr, list): return []
+            out = []
+            for step in arr:
+                if not isinstance(step, dict): continue
+                # sanitize
+                d = {
+                    "mode": int(clamp(step.get("mode", 0), 0, 13)),
+                    "duration": int(clamp(step.get("duration", 1000), 1, 60000)),
+                }
+                # optional overrides
+                for k in ("speed","intensity","width","paletteCount","colorA","colorB","colorC","colorD"):
+                    if k in step: d[k] = step[k]
+                out.append(d)
+            return out
+        except Exception:
+            return []
+
     def apply_cfg(self, cfg, initial=False):
+        # Merge
         c = self.cfg
         if "count" in cfg:
             v = cfg.get("count",[8,12,12,12])
@@ -182,27 +224,107 @@ class RGBSim(QWidget):
 
         for k in ("brightness","mode","speed","intensity","width",
                   "colorA","colorB","colorC","colorD","paletteCount",
-                  "resumeOnBoot","enableCpu","enableFan"):
+                  "resumeOnBoot","enableCpu","enableFan","masterOff"):
             if k in cfg: c[k] = cfg[k]
 
-        # NEW: per-channel reverse
+        # per-channel reverse
         if "reverse" in cfg and isinstance(cfg["reverse"], (list,tuple)) and len(cfg["reverse"])>=4:
             c["reverse"] = [bool(cfg["reverse"][i]) for i in range(4)]
             self.canvas.set_reverse(c["reverse"])
 
+        # Custom playlist related
+        if "customLoop" in cfg: c["customLoop"] = bool(cfg["customLoop"])
+        if "customSeq" in cfg:  c["customSeq"]  = cfg["customSeq"]
+
         # Meta (optional)
         if "buildVersion" in cfg: c["buildVersion"] = cfg["buildVersion"]
 
+        # Base (non-custom) timing/params
         spd = clamp(int(c["speed"]),0,255)
-        self.canvas.frame_ms = max(10, 10 + (255 - spd)//2)
+        self.canvas.base_frame_ms = max(10, 10 + (255 - spd)//2)
         self.canvas.brightness = clamp(int(c["brightness"]),1,255)/255.0
         self.canvas.colors = [c["colorA"], c["colorB"], c["colorC"], c["colorD"]]
         self.canvas.palette_count = int(clamp(c.get("paletteCount",2),1,4))
-        self.canvas.mode = int(c["mode"])
+        self.canvas.master_off = bool(c.get("masterOff", False))
+
+        # Custom playlist activation & parsing
+        if int(c["mode"]) == 14:
+            self._cust_seq  = self._parse_custom_seq(c.get("customSeq","[]"))
+            self._cust_loop = bool(c.get("customLoop", True))
+            self._cust_active = len(self._cust_seq) > 0
+            self._cust_idx = 0
+            self._cust_step_started = time.time()
+        else:
+            self._cust_active = False
+            self.canvas.mode = int(c["mode"])
+            self.canvas.width = int(clamp(c.get("width",4),1,255))
+            self.canvas.intensity = int(clamp(c.get("intensity",128),0,255))
+            self.canvas.frame_ms = self.canvas.base_frame_ms
+
         if not initial: self.canvas.invalidate_all()
+
+    def _effective_from_step(self, base: Dict[str, Any], step: Dict[str, Any]) -> Dict[str, Any]:
+        eff = dict(base)
+        # Apply overrides from step
+        eff["mode"] = int(step.get("mode", eff["mode"]))
+        for k in ("speed","intensity","width","paletteCount","colorA","colorB","colorC","colorD"):
+            if k in step: eff[k] = step[k]
+        # Clamp common fields
+        eff["speed"] = int(clamp(eff.get("speed",128), 0, 255))
+        eff["intensity"] = int(clamp(eff.get("intensity",128), 0, 255))
+        eff["width"] = int(clamp(eff.get("width",4), 1, 255))
+        eff["paletteCount"] = int(clamp(eff.get("paletteCount",2), 1, 4))
+        return eff
 
     def tick_anim(self):
         self.ticks += 1
+
+        # Handle custom playlist playback
+        if self._cust_active and self._cust_seq:
+            now = time.time()
+            step = self._cust_seq[self._cust_idx]
+            dur_ms = int(step.get("duration", 1000))
+            if (now - self._cust_step_started) * 1000.0 >= dur_ms:
+                # advance
+                if self._cust_idx + 1 < len(self._cust_seq):
+                    self._cust_idx += 1
+                    self._cust_step_started = now
+                else:
+                    if self._cust_loop:
+                        self._cust_idx = 0
+                        self._cust_step_started = now
+                    else:
+                        # Hold last frame/effect; keep active but no advance
+                        self._cust_step_started = now  # stop drift
+            step = self._cust_seq[self._cust_idx]
+
+            # Build effective settings from base cfg + step overrides
+            base = {
+                "mode": 0,
+                "speed": self.cfg.get("speed",128),
+                "intensity": self.cfg.get("intensity",128),
+                "width": self.cfg.get("width",4),
+                "paletteCount": self.cfg.get("paletteCount",2),
+                "colorA": self.cfg.get("colorA",0xFF0000),
+                "colorB": self.cfg.get("colorB",0xFFA000),
+                "colorC": self.cfg.get("colorC",0x00FF00),
+                "colorD": self.cfg.get("colorD",0x0000FF),
+            }
+            eff = self._effective_from_step(base, step)
+
+            # Push effective params into canvas
+            self.canvas.mode = int(eff["mode"])
+            self.canvas.width = eff["width"]
+            self.canvas.intensity = eff["intensity"]
+            self.canvas.palette_count = eff["paletteCount"]
+            self.canvas.colors = [eff["colorA"], eff["colorB"], eff["colorC"], eff["colorD"]]
+            # Adjust frame time by effective speed
+            self.canvas.frame_ms = max(10, 10 + (255 - eff["speed"])//2)
+            self.canvas.master_off = bool(self.cfg.get("masterOff", False))
+        else:
+            # Non-custom: keep using base params
+            self.canvas.frame_ms = getattr(self.canvas, "base_frame_ms", 16)
+
         self.canvas.advance()
 
 # -------------------- Drawing / effects --------------------
@@ -215,10 +337,18 @@ class Canvas(QWidget):
         self.points: List[QPointF] = []
         self.ring_len = sum(self.counts)
         self.pix = [(0,0,0)] * self.ring_len
+
+        # Parameters updated from sim
         self.mode = 4
         self.colors = [0xFF0000,0xFFA000,0x00FF00,0x0000FF]
         self.palette_count = 2
+        self.intensity = 128
+        self.width = 4
         self.brightness = 180/255.0
+        self.master_off = False
+
+        # Timing
+        self.base_frame_ms = 16
         self.frame_ms = 16
         self._accum = 0
         self._tick  = 0
@@ -293,125 +423,151 @@ class Canvas(QWidget):
         L = self.ring_len if self.ring_len>0 else 1
         t = self._tick
 
-        if self.mode == 0:  # Solid
+        # Master Off: full blackout
+        if self.master_off:
+            self.pix = [(0,0,0)]*L
+            self.update()
+            return
+
+        mode = self.mode
+        width = max(1, min(64, int(self.width)))
+        intensity = max(0, min(255, int(self.intensity)))
+
+        if mode == 0:  # Solid
             c = self.colors[0]; r,g,b = (c>>16)&255,(c>>8)&255,c&255
             self.pix = [(r,g,b)]*L
 
-        elif self.mode == 1:  # Breathe
+        elif mode == 1:  # Breathe (use intensity as depth)
             base = self.colors[0]
-            br = 0.12 + 0.88*(math.sin(t*0.06)*0.5+0.5)
+            depth = 0.10 + 0.90*(intensity/255.0)
+            br = (1.0-depth) + depth*(math.sin(t*0.06)*0.5+0.5)
             r,g,b = (base>>16)&255,(base>>8)&255,base&255
             self.pix = [(int(r*br),int(g*br),int(b*br)) for _ in range(L)]
 
-        elif self.mode == 2:  # Color Wipe
+        elif mode == 2:  # Color Wipe (width controls trail length)
             idx = (t//2)%L; off=(0,0,0)
             self.pix = [off]*L
-            c = self.colors[0]
-            self.pix[idx] = ((c>>16)&255,(c>>8)&255,c&255)
+            c = self.colors[0]; cr,cg,cb=(c>>16)&255,(c>>8)&255,c&255
+            for k in range(width):
+                p = (idx - k) % L
+                fall = 1.0 - k/float(max(1,width))
+                self.pix[p] = (int(cr*fall), int(cg*fall), int(cb*fall))
 
-        elif self.mode == 3:  # Larson
+        elif mode == 3:  # Larson (width controls bar half-span)
             pos = (t//3)%(L*2)
             if pos >= L: pos = 2*L-1-pos
-            fade = 0.85
+            fade = 0.80 + 0.19*(intensity/255.0)
             self.pix = [(int(r*fade),int(g*fade),int(b*fade)) for (r,g,b) in self.pix]
             head = self.colors[0]; r,g,b=(head>>16)&255,(head>>8)&255,head&255
-            w = 4
+            w = max(1, min(20, width))
             for k in range(-w,w+1):
                 p = pos+k
                 if 0 <= p < L:
                     alpha = 1.0 - abs(k)/(w+0.0001)
                     self.pix[p] = (int(r*alpha),int(g*alpha),int(b*alpha))
 
-        elif self.mode == 4:  # Rainbow
-            denom = 6
+        elif mode == 4:  # Rainbow
+            denom = max(2, 8 - int(6*(intensity/255.0)))
             offset = (t//denom) & 255
             self.pix = [ wheel((i*256//L + offset) & 255) for i in range(L) ]
 
-        elif self.mode == 5:  # Theater
-            gap = 3; q = (t//8) % gap
+        elif mode == 5:  # Theater
+            gap = max(2, min(10, width))
+            q = (t//max(2, 12 - int(10*(intensity/255.0)))) % gap
             base = self.colors[0]; r,g,b=(base>>16)&255,(base>>8)&255,base&255
             fade = 0.6
             self.pix = [(int(pr*fade),int(pg*fade),int(pb*fade)) for (pr,pg,pb) in self.pix]
             for i in range(q, L, gap): self.pix[i] = (r,g,b)
 
-        elif self.mode == 6:  # Twinkle
-            fade = 0.92
+        elif mode == 6:  # Twinkle
+            fade = 0.90 + 0.09*(1.0 - intensity/255.0)
             self.pix = [(int(r*fade),int(g*fade),int(b*fade)) for (r,g,b) in self.pix]
-            pops = 1 + L//20
+            pops = 1 + max(1, L//max(12, 30 - width*2))
             base = self.colors[0]; r,g,b=(base>>16)&255,(base>>8)&255,base&255
             for _ in range(pops): self.pix[random.randrange(L)] = (r,g,b)
 
-        elif self.mode == 7:  # Comet
-            pos = (t//3)%L
+        elif mode == 7:  # Comet
+            pos = (t//max(1, 4 - int(3*(intensity/255.0))))%L
             head = self.colors[0]; hr,hg,hb=(head>>16)&255,(head>>8)&255,head&255
-            fade = 0.85
+            fade = 0.80 + 0.19*(1.0 - intensity/255.0)
             self.pix = [(int(r*fade),int(g*fade),int(b*fade)) for (r,g,b) in self.pix]
-            width = 6
-            for w in range(width):
-                tail = 1.0 - (w/width)
-                p = (pos - w) % L
+            w = max(2, min(30, width*2))
+            for k in range(w):
+                tail = 1.0 - (k/float(w))
+                p = (pos - k) % L
                 self.pix[p] = (int(hr*tail),int(hg*tail),int(hb*tail))
 
-        elif self.mode == 8:  # Meteor
+        elif mode == 8:  # Meteor
             pos = (t//3)%L
             a = self.colors[0]; b = self.colors[1]
             ar,ag,ab=(a>>16)&255,(a>>8)&255,a&255
             br,bg,bb=(b>>16)&255,(b>>8)&255,b&255
-            width = 5
+            w = max(3, min(30, width+3))
             self.pix = [(0,0,0)]*L
-            for w in range(width):
-                tt = w/(width-1 if width>1 else 1)
+            for k in range(w):
+                tt = k/(w-1 if w>1 else 1)
                 r = int(ar*(1-tt)+br*tt); g = int(ag*(1-tt)+bg*tt); b_ = int(ab*(1-tt)+bb*tt)
-                self.pix[(pos+w)%L] = (r,g,b_)
+                self.pix[(pos+k)%L] = (r,g,b_)
 
-        elif self.mode == 9:  # Clock Spin
-            pos = (t//3)%L; span = 9
+        elif mode == 9:  # Clock Spin
+            pos = (t//3)%L; span = max(3, min(40, width*2+1))
             bg = self.colors[1]; fg = self.colors[0]
             bgr,bgg,bgb=(bg>>16)&255,(bg>>8)&255,bg&255
             fgr,fgg,fgb=(fg>>16)&255,(fg>>8)&255,fg&255
             self.pix = [(bgr,bgg,bgb)]*L
-            for w in range(span): self.pix[(pos+w)%L]=(fgr,fgg,fgb)
+            for k in range(span): self.pix[(pos+k)%L]=(fgr,fgg,fgb)
 
-        elif self.mode == 10:  # Plasma
+        elif mode == 10:  # Plasma
+            sat = 0.5 + 0.5*(intensity/255.0)
             out = []
             for i in range(L):
                 a = (i/L)*math.tau
                 v = 0.5 + 0.5*(math.sin(3*a + t*0.08)*0.5 + math.sin(5*a - t*0.05)*0.5)
                 hue = (v*0.7 + (t*0.01)) % 1.0
-                out.append(hsv2rgb(hue, 0.9, 1.0))
+                out.append(hsv2rgb(hue, sat, 1.0))
             self.pix = out
 
-        elif self.mode == 11:  # Fire (rough)
+        elif mode == 11:  # Fire (stylized)
             fade = 0.86
             self.pix = [(int(r*fade),int(g*fade),int(b*fade)) for (r,g,b) in self.pix]
-            sparks = 1 + L//12
+            sparks = 1 + max(1, L//max(10, 24 - width))
             for _ in range(sparks):
                 k = random.randrange(L)
                 self.pix[k] = (255, random.randrange(160,255), 0)
 
-        elif self.mode == 12:  # Palette Cycle
+        elif mode == 12:  # Palette Cycle
             n = max(1, self.palette_count)
             pal = [self.colors[i] for i in range(n)]
             off = (t*0.01) % 1.0
             out = []
+            blend = intensity / 255.0
             for i in range(L):
                 x = (i/L + off) % 1.0
                 pos = x*n; i0 = int(pos) % n; i1 = (i0+1)%n; frac = pos - int(pos)
                 a = pal[i0]; b = pal[i1]
                 ar,ag,ab=(a>>16)&255,(a>>8)&255,a&255; br,bg,bb=(b>>16)&255,(b>>8)&255,b&255
-                r = int(ar*(1-frac)+br*frac); g = int(ag*(1-frac)+bg*frac); b_ = int(ab*(1-frac)+bb*frac)
+                r = int(ar*(1-frac*blend)+br*(frac*blend))
+                g = int(ag*(1-frac*blend)+bg*(frac*blend))
+                b_ = int(ab*(1-frac*blend)+bb*(frac*blend))
                 out.append((r,g,b_))
             self.pix = out
 
-        elif self.mode == 13:  # Palette Chase
+        elif mode == 13:  # Palette Chase
             n = max(1, self.palette_count)
             pal = [self.colors[i] for i in range(n)]
-            block = 4; pos = (t//3)%self.ring_len
+            block = max(1, min(40, width))
+            pos = (t//3)%self.ring_len
             out = []
+            soft = intensity/255.0
             for i in range(L):
                 k = (i + L - pos) % L
                 which = (k // block) % n
-                c = pal[which]; out.append(((c>>16)&255,(c>>8)&255,c&255))
+                c = pal[which]; r,g,b = (c>>16)&255,(c>>8)&255,c&255
+                edge = k % block
+                tEdge = abs(edge - (block-1)/2.0) / (block/2.0 if block>1 else 1)
+                s = 1.0 - soft * tEdge
+                if s < 0: s = 0
+                out.append((int(r*s),int(g*s),int(b*s)))
             self.pix = out
 
         # brightness
@@ -452,11 +608,7 @@ class Canvas(QWidget):
         qp.drawText(QRectF(-60, -10, 120, 20), Qt.AlignCenter, "Right (CH4)")
         qp.restore()
 
-        # LEDs with per-channel reverse mapping:
-        # points[] is in ring order; pix[] holds ring colors.
-        # For each channel, if reverse[ch] is True, we draw pixel k at position k
-        # using color from index (count-1-k) within that channel — this mirrors
-        # the firmware's setRing() behavior with REVERSE[].
+        # LEDs with per-channel reverse mapping
         if len(self.points) != self.ring_len:
             self.rebuild_points()
 
