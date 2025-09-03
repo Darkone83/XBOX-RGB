@@ -1,6 +1,6 @@
 # JSON Format for Custom Animations
 
-This document explains how to define and upload **custom LED animations** using JSON with the RGBCtrl firmware.
+This document explains how to define and upload **custom LED animations** using JSON with the XBOX RGB firmware.
 
 ---
 
