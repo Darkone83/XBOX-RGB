@@ -6,12 +6,13 @@
 #include <ESPAsyncWebServer.h>
 #include <math.h>
 #include <esp_system.h>  // esp_random
+#include <vector>
 
 // Use the existing WiFiMgr server; no separate server objects needed.
 namespace WiFiMgr { AsyncWebServer& getServer(); }
 
 // -------------------- Build / Branding --------------------
-static const char* APP_VERSION = "1.5.3"; // shown in footer
+static const char* APP_VERSION = "1.6.0"; // shown in footer
 static const char* COPYRIGHT_TXT = "© Darkone Customs 2025";
 
 // -------------------- Limits / Types --------------------
@@ -69,9 +70,17 @@ struct AppConfig {
   bool     enableCpu     = true;
   bool     enableFan     = true;
 
-  // NEW: per-channel reverse (runtime toggles; seeded from compile-time defaults)
+  // per-channel reverse (runtime toggles; seeded from compile-time defaults)
   bool     reverse[NUM_CH] = { REVERSE_DEFAULTS[0], REVERSE_DEFAULTS[1],
                                REVERSE_DEFAULTS[2], REVERSE_DEFAULTS[3] };
+
+  // --- NEW: Master Off (kill switch) ---
+  bool     masterOff     = false;
+
+  // --- NEW: Custom playlist mode ---
+  // JSON string of steps; see Custom editor in WebUI for example.
+  String   customSeq     = "[]";
+  bool     customLoop    = true;
 } CFG;
 
 static bool inPreview = false;
@@ -90,9 +99,12 @@ enum : uint8_t {
   MODE_PLASMA,
   MODE_FIRE,
 
-  // NEW palette-aware modes:
+  // palette-aware modes:
   MODE_PALETTE_CYCLE,   // colors placed around ring; rotates
   MODE_PALETTE_CHASE,   // blocks of palette colors chase around ring
+
+  // --- NEW: user-defined playlist mode ---
+  MODE_CUSTOM,
 
   MODE_COUNT
 };
@@ -107,6 +119,12 @@ static uint8_t heat[MAX_RING]; // 0..255 heat map
 
 // track last applied brightness
 static uint8_t lastAppliedBrightness = 0xFF;
+
+// --- Boot fade-in state ---
+static bool     bootFadeActive      = false;
+static uint32_t bootFadeStartMs     = 0;
+static uint16_t bootFadeDurationMs  = 3200;   // fade time (ms) — tweak to taste
+static uint8_t  bootFadeTarget      = 0;
 
 // -------------------- Helpers --------------------
 inline RgbColor rgbFrom24(uint32_t rgb) {
@@ -164,12 +182,32 @@ static void fadeRing(uint8_t amt) {
 }
 
 static void showRing() {
-  if (lastAppliedBrightness != CFG.brightness) {
-    for (uint8_t s=0; s<NUM_CH; ++s) STRIPS[s]->setBrightness(CFG.brightness);
-    lastAppliedBrightness = CFG.brightness;
+  // Boot fade: linearly ramp 0 -> target over bootFadeDurationMs
+  if (bootFadeActive) {
+    bootFadeTarget = CFG.brightness;                     // follow live target
+    uint32_t elapsed = millis() - bootFadeStartMs;
+    uint8_t cur = (elapsed >= bootFadeDurationMs)
+                    ? bootFadeTarget
+                    : (uint8_t)((uint32_t)bootFadeTarget * elapsed / bootFadeDurationMs);
+
+    // Ensure at least 1 when target>0 so the user sees early glow
+    if (bootFadeTarget && cur == 0) cur = 1;
+
+    if (cur != lastAppliedBrightness) {
+      for (uint8_t s=0; s<NUM_CH; ++s) STRIPS[s]->setBrightness(cur);
+      lastAppliedBrightness = cur;
+    }
+    if (elapsed >= bootFadeDurationMs) bootFadeActive = false;
+  } else {
+    if (lastAppliedBrightness != CFG.brightness) {
+      for (uint8_t s=0; s<NUM_CH; ++s) STRIPS[s]->setBrightness(CFG.brightness);
+      lastAppliedBrightness = CFG.brightness;
+    }
   }
+
   for (uint8_t s=0; s<NUM_CH; ++s) STRIPS[s]->show();
 }
+
 static RgbColor wheel(uint8_t pos) {
   if (pos < 85)   return RgbColor(255 - pos*3, pos*3, 0);
   if (pos < 170)  { pos -= 85;  return RgbColor(0, 255 - pos*3, pos*3); }
@@ -626,8 +664,127 @@ static void animPaletteChase() {
   }
 }
 
+// -------------------- NEW: Custom sequence (playlist) --------------------
+struct CustomStep {
+  uint8_t  mode = MODE_SOLID;
+  uint16_t duration = 1000; // ms
+  // Optional overrides
+  bool hasSpeed=false;     uint8_t speed=0;
+  bool hasIntensity=false; uint8_t intensity=0;
+  bool hasWidth=false;     uint8_t width=0;
+  bool hasPCnt=false;      uint8_t pcount=0;
+  bool hasA=false;         uint32_t colorA=0;
+  bool hasB=false;         uint32_t colorB=0;
+  bool hasC=false;         uint32_t colorC=0;
+  bool hasD=false;         uint32_t colorD=0;
+};
+
+static bool parseCustomSteps(const String& js, std::vector<CustomStep>& out) {
+  out.clear();
+  if (!js.length()) return true;
+  StaticJsonDocument<2048> doc;
+  auto err = deserializeJson(doc, js);
+  if (err || !doc.is<JsonArray>()) return false;
+  for (JsonVariant v : doc.as<JsonArray>()) {
+    if (!v.is<JsonObject>()) continue;
+    JsonObject o = v.as<JsonObject>();
+    CustomStep s;
+    s.mode = (uint8_t) (o.containsKey("mode") ? o["mode"].as<int>() : MODE_SOLID);
+    int dur = o.containsKey("duration") ? o["duration"].as<int>() : 1000;
+    if (dur < 1) dur = 1; if (dur > 60000) dur = 60000;
+    s.duration = (uint16_t)dur;
+    if (o.containsKey("speed"))       { s.hasSpeed=true;     s.speed=o["speed"].as<uint8_t>(); }
+    if (o.containsKey("intensity"))   { s.hasIntensity=true; s.intensity=o["intensity"].as<uint8_t>(); }
+    if (o.containsKey("width"))       { s.hasWidth=true;     int w=o["width"].as<int>(); if(w<1)w=1; if(w>255)w=255; s.width=(uint8_t)w; }
+    if (o.containsKey("paletteCount")){ s.hasPCnt=true;      uint8_t pc=o["paletteCount"].as<uint8_t>(); s.pcount=(pc<1)?1:((pc>4)?4:pc); }
+    if (o.containsKey("colorA"))      { s.hasA=true; s.colorA=o["colorA"].as<uint32_t>(); }
+    if (o.containsKey("colorB"))      { s.hasB=true; s.colorB=o["colorB"].as<uint32_t>(); }
+    if (o.containsKey("colorC"))      { s.hasC=true; s.colorC=o["colorC"].as<uint32_t>(); }
+    if (o.containsKey("colorD"))      { s.hasD=true; s.colorD=o["colorD"].as<uint32_t>(); }
+    out.push_back(s);
+  }
+  return true;
+}
+
+static void applyStepOverrides(const CustomStep& s) {
+  if (s.hasSpeed)     CFG.speed = s.speed;
+  if (s.hasIntensity) CFG.intensity = s.intensity;
+  if (s.hasWidth)     CFG.width = s.width;
+  if (s.hasPCnt)      CFG.paletteCount = s.pcount;
+  if (s.hasA)         CFG.colorA = s.colorA;
+  if (s.hasB)         CFG.colorB = s.colorB;
+  if (s.hasC)         CFG.colorC = s.colorC;
+  if (s.hasD)         CFG.colorD = s.colorD;
+}
+
+static void animCustom() {
+  static std::vector<CustomStep> seq;
+  static String lastJs;
+  static uint32_t stepStart=0;
+  static size_t idx=0;
+
+  // (Re)parse if changed
+  if (lastJs != CFG.customSeq) {
+    seq.clear();
+    parseCustomSteps(CFG.customSeq, seq);
+    lastJs = CFG.customSeq;
+    idx = 0; stepStart = millis();
+  }
+
+  if (seq.empty()) {
+    // No steps → black (silence)
+    fillRing(RgbColor(0,0,0));
+    return;
+  }
+
+  uint32_t now = millis();
+  const CustomStep& s = seq[idx];
+
+  // Apply per-step parameter overrides when entering a step
+  static size_t lastIdx = (size_t)-1;
+  if (idx != lastIdx) {
+    applyStepOverrides(s);
+    lastIdx = idx;
+  }
+
+  // Run selected base mode with current CFG (overrides applied)
+  switch (s.mode) {
+    case MODE_SOLID:         animSolid();         break;
+    case MODE_BREATHE:       animBreathe();       break;
+    case MODE_COLOR_WIPE:    animColorWipe();     break;
+    case MODE_LARSON:        animLarson();        break;
+    case MODE_RAINBOW:       animRainbow();       break;
+    case MODE_THEATER:       animTheater();       break;
+    case MODE_TWINKLE:       animTwinkle();       break;
+    case MODE_COMET:         animComet();         break;
+    case MODE_METEOR:        animMeteor();        break;
+    case MODE_CLOCK_SPIN:    animClockSpin();     break;
+    case MODE_PLASMA:        animPlasma();        break;
+    case MODE_FIRE:          animFire();          break;
+    case MODE_PALETTE_CYCLE: animPaletteCycle();  break;
+    case MODE_PALETTE_CHASE: animPaletteChase();  break;
+    default:                 animSolid();         break;
+  }
+
+  // Step advance
+  if (now - stepStart >= s.duration) {
+    stepStart = now;
+    idx++;
+    if (idx >= seq.size()) {
+      idx = CFG.customLoop ? 0 : (seq.size()-1);
+    }
+  }
+}
+
 // -------------------- Frame selection --------------------
 static void renderFrame() {
+  // --- NEW: Master Off (force black regardless of mode) ---
+  if (CFG.masterOff) {
+    fillRing(RgbColor(0,0,0));
+    showRing();
+    return;
+  }
+
   switch (CFG.mode) {
     case MODE_SOLID:         animSolid();         break;
     case MODE_BREATHE:       animBreathe();       break;
@@ -642,9 +799,11 @@ static void renderFrame() {
     case MODE_PLASMA:        animPlasma();        break;
     case MODE_FIRE:          animFire();          break;
 
-    // NEW palette modes
     case MODE_PALETTE_CYCLE: animPaletteCycle();  break;
     case MODE_PALETTE_CHASE: animPaletteChase();  break;
+
+    // NEW: Custom playlist
+    case MODE_CUSTOM:        animCustom();        break;
 
     default: break;
   }
@@ -658,7 +817,7 @@ static const char* NVS_KEY= "config";
 static void defaults() { CFG = AppConfig(); }
 
 static String configToJson() {
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
   JsonArray counts = doc.createNestedArray("count");
   for (uint8_t i=0;i<NUM_CH;++i) counts.add(CFG.count[i]);
   doc["brightness"]   = CFG.brightness;
@@ -676,9 +835,14 @@ static String configToJson() {
   doc["enableFan"]    = CFG.enableFan;
   doc["inPreview"]    = inPreview;
 
-  // NEW: per-channel reverse
+  // per-channel reverse
   JsonArray rev = doc.createNestedArray("reverse");
   for (uint8_t i=0;i<NUM_CH;++i) rev.add(CFG.reverse[i]);
+
+  // NEW fields
+  doc["masterOff"]   = CFG.masterOff;
+  doc["customSeq"]   = CFG.customSeq;
+  doc["customLoop"]  = CFG.customLoop;
 
   // Non-persistent display info
   doc["buildVersion"] = APP_VERSION;
@@ -687,7 +851,7 @@ static String configToJson() {
   String js; serializeJson(doc, js); return js;
 }
 static bool parseConfig(const String& body, AppConfig& out) {
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
   if (deserializeJson(doc, body)) return false;
 
   if (doc.containsKey("count")) {
@@ -729,15 +893,19 @@ static bool parseConfig(const String& body, AppConfig& out) {
   if (doc.containsKey("enableCpu"))   out.enableCpu   = doc["enableCpu"].as<bool>();
   if (doc.containsKey("enableFan"))   out.enableFan   = doc["enableFan"].as<bool>();
 
-  // NEW: per-channel reverse
+  // per-channel reverse
   if (doc.containsKey("reverse")) {
     for (uint8_t i=0;i<NUM_CH;++i) {
-      // guard against missing or short arrays
       if (!doc["reverse"][i].isNull()) {
         out.reverse[i] = doc["reverse"][i].as<bool>();
       }
     }
   }
+
+  // NEW fields
+  if (doc.containsKey("masterOff"))   out.masterOff = doc["masterOff"].as<bool>();
+  if (doc.containsKey("customLoop"))  out.customLoop= doc["customLoop"].as<bool>();
+  if (doc.containsKey("customSeq"))   out.customSeq = doc["customSeq"].as<const char*>();
 
   return true;
 }
@@ -752,7 +920,7 @@ static void loadConfig() {
   prefs.end();
   if (!js.length()) { defaults(); return; }
 
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
   if (!deserializeJson(doc, js)) {
     AppConfig tmp = CFG;
     if (doc.containsKey("count")) {
@@ -788,7 +956,7 @@ static void loadConfig() {
     if (doc.containsKey("enableCpu"))   tmp.enableCpu   = doc["enableCpu"].as<bool>();
     if (doc.containsKey("enableFan"))   tmp.enableFan   = doc["enableFan"].as<bool>();
 
-    // NEW: per-channel reverse
+    // per-channel reverse
     if (doc.containsKey("reverse")) {
       for (uint8_t i=0;i<NUM_CH;++i) {
         if (!doc["reverse"][i].isNull()) {
@@ -797,11 +965,16 @@ static void loadConfig() {
       }
     }
 
+    // NEW fields
+    if (doc.containsKey("masterOff"))   tmp.masterOff = doc["masterOff"].as<bool>();
+    if (doc.containsKey("customLoop"))  tmp.customLoop= doc["customLoop"].as<bool>();
+    if (doc.containsKey("customSeq"))   tmp.customSeq = doc["customSeq"].as<const char*>();
+
     CFG = tmp;
   }
 }
 static void saveConfig() {
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
   JsonArray counts = doc.createNestedArray("count");
   for (uint8_t i=0;i<NUM_CH;++i) counts.add(CFG.count[i]);
   doc["brightness"]   = CFG.brightness;
@@ -818,9 +991,14 @@ static void saveConfig() {
   doc["enableCpu"]    = CFG.enableCpu;
   doc["enableFan"]    = CFG.enableFan;
 
-  // NEW: per-channel reverse
+  // per-channel reverse
   JsonArray rev = doc.createNestedArray("reverse");
   for (uint8_t i=0;i<NUM_CH;++i) rev.add(CFG.reverse[i]);
+
+  // NEW fields
+  doc["masterOff"]   = CFG.masterOff;
+  doc["customSeq"]   = CFG.customSeq;
+  doc["customLoop"]  = CFG.customLoop;
 
   String js; serializeJson(doc, js);
   prefs.begin(NVS_NS, false);
@@ -854,6 +1032,22 @@ fieldset{border:1px solid #273657;border-radius:12px;padding:8px 10px}
 legend{padding:0 6px;color:#9ec1ff;font-size:12px}
 .inline{display:flex;gap:10px;flex-wrap:wrap}
 .inline>label{display:flex;align-items:center;gap:6px;margin:0}
+textarea{width:100%;min-height:120px;border-radius:10px;border:1px solid #2a3142;background:#0b0e14;color:#d6e1ff;padding:10px 12px}
+code{background:#0b1220;border:1px solid #273657;border-radius:6px;padding:2px 6px}
+/* Playlist editor */
+.plist{display:flex;flex-direction:column;gap:10px;margin-top:10px}
+.step{border:1px solid #273657;border-radius:10px;padding:10px;background:#0b1220}
+.step .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:10px}
+.step .grid>div{grid-column:span 12}
+@media(min-width:900px){
+  .step .grid .col-2{grid-column:span 2}
+  .step .grid .col-3{grid-column:span 3}
+  .step .grid .col-4{grid-column:span 4}
+}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.btn-xs{padding:6px 10px;border-radius:8px;border:1px solid #2a3142;background:#10182a;color:#d6e1ff;cursor:pointer}
+.btn-xs:hover{filter:brightness(1.1)}
+.muted{color:#90a4c9;font-size:12px}
 </style></head><body><div class="container">
 <div class="card">
   <h2 class="h">RGB Controller (CH1–CH4)<span id="status" class="badge">loading…</span></h2>
@@ -874,6 +1068,7 @@ legend{padding:0 6px;color:#9ec1ff;font-size:12px}
         <option value="11">Fire / Flicker</option>
         <option value="12">Palette Cycle</option>
         <option value="13">Palette Chase</option>
+        <option value="14">Custom (Playlist)</option>
       </select>
     </div>
     <div class="md-4"><label>Brightness</label><input id="brightness" type="range" min="1" max="255"></div>
@@ -899,7 +1094,7 @@ legend{padding:0 6px;color:#9ec1ff;font-size:12px}
     <div class="md-3"><label>CH3 (Rear) Count</label><input id="c2" type="number" min="0" max="50"></div>
     <div class="md-3"><label>CH4 (Right) Count</label><input id="c3" type="number" min="0" max="50"></div>
 
-    <!-- NEW: per-channel reverse toggles -->
+    <!-- per-channel reverse toggles -->
     <div class="md-12">
       <fieldset>
         <legend>Channel Direction</legend>
@@ -908,6 +1103,51 @@ legend{padding:0 6px;color:#9ec1ff;font-size:12px}
           <label><input id="rev1" type="checkbox"> Reverse CH2 (Left)</label>
           <label><input id="rev2" type="checkbox"> Reverse CH3 (Rear)</label>
           <label><input id="rev3" type="checkbox"> Reverse CH4 (Right)</label>
+        </div>
+      </fieldset>
+    </div>
+
+    <!-- NEW: Master Off -->
+    <div class="md-12">
+      <fieldset>
+        <legend>Master</legend>
+        <div class="inline">
+          <label><input id="masterOff" type="checkbox"> Master Off (blank all channels)</label>
+        </div>
+      </fieldset>
+    </div>
+
+    <!-- NEW: Custom Playlist Editor -->
+    <div class="md-12 opt opt-custom hide">
+      <fieldset>
+        <legend>Custom Playlist</legend>
+        <div class="inline" style="align-items:center">
+          <label><input id="customLoop" type="checkbox" checked> Loop playlist</label>
+        </div>
+        <label>Steps (JSON array)</label>
+        <textarea id="customSeq" rows="8"></textarea>
+        <div class="hint">
+          Build from existing modes for stability. Example:
+          <code>[{"mode":0,"duration":1000,"colorA":16711680},{"mode":7,"duration":1200,"speed":200,"width":6},{"mode":12,"duration":1500,"paletteCount":3}]</code>
+        </div>
+      </fieldset>
+    </div>
+
+    <!-- NEW: Custom Playlist Editor (Visual) -->
+    <div class="md-12 opt opt-custom hide">
+      <fieldset>
+        <legend>Custom Playlist</legend>
+        <div class="inline" style="align-items:center">
+          <label><input id="customLoop" type="checkbox" checked> Loop playlist</label>
+          <button id="addStep" type="button" class="btn-xs">Add Step</button>
+          <button id="clearSteps" type="button" class="btn-xs">Clear</button>
+          <span class="muted">Drag not required: use Up/Down per step</span>
+        </div>
+        <div id="plist" class="plist"></div>
+        <!-- Keep a hidden field with JSON for firmware compatibility -->
+        <textarea id="customSeq" class="hide" rows="1"></textarea>
+        <div class="hint">
+          The editor builds the playlist for you. Each step plays one built-in mode for a duration.
         </div>
       </fieldset>
     </div>
@@ -949,15 +1189,20 @@ const BOOT = %%BOOTJSON%%;
 
 let state=null, syncing=false;
 
+
+// Labels for per-step Mode selector (indexes must match main Mode list)
+const MODE_LABELS=["Solid","Breathe","Color Wipe","Larson","Rainbow","Theater Chase","Twinkle","Comet","Meteor","Clock Spin","Plasma","Fire / Flicker","Palette Cycle","Palette Chase"];
+
 function showOptsFor(mode){
   const vis = {
-    colorA:   [0,1,2,3,4,5,6,7,8,9,10,11,12,13],
-    colorB:   [8,9,10,12,13],
-    colorC:   [12,13],
-    colorD:   [12,13],
-    palette:  [12,13],
-    width:    [3,5,7,8,9,13],        // Palette Chase uses width (block size)
-    intensity:[3,5,6,7,8,11,12,13],  // palette blend / soft edges
+    colorA:   [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14],
+    colorB:   [8,9,10,12,13,14],
+    colorC:   [12,13,14],
+    colorD:   [12,13,14],
+    palette:  [12,13,14],
+    width:    [3,5,7,8,9,13,14],        // Palette Chase & Custom
+    intensity:[3,5,6,7,8,11,12,13,14],  // palette blend / soft edges
+    custom:   [14]
   };
 
   const on = k => (vis[k]||[]).includes(mode);
@@ -971,6 +1216,7 @@ function showOptsFor(mode){
   toggle('.opt-palette', on('palette'));
   toggle('.opt-width',  on('width'));
   toggle('.opt-intensity', on('intensity'));
+  toggle('.opt-custom', on('custom'));
 
   // further trim Color C/D by palette size when palette modes are active
   if (on('palette')) {
@@ -996,9 +1242,14 @@ function fillForm(s){
   el('paletteCount').value = s.paletteCount || 2;
   for(let i=0;i<4;i++) el('c'+i).value = s.count[i];
 
-  // NEW: reverse flags
+  // reverse flags
   const rev = s.reverse || [false,false,false,false];
   for(let i=0;i<4;i++) { const n = el('rev'+i); if (n) n.checked = !!rev[i]; }
+
+  // NEW
+  el('masterOff').checked = !!s.masterOff;
+  el('customLoop').checked = !!s.customLoop;
+  el('customSeq').value = (s.customSeq && String(s.customSeq).length) ? s.customSeq : "[]";
 
   el('resume').value    = s.resumeOnBoot ? 'true' : 'false';
   el('smbusCpu').checked= !!s.enableCpu;
@@ -1009,6 +1260,14 @@ function fillForm(s){
   el('cpy').textContent = s.copyright || '© Darkone Customs 2025';
 
   showOptsFor(s.mode|0);
+
+  // Build the visual playlist from saved JSON
+  try {
+    const steps = JSON.parse(s.customSeq || "[]");
+    setPlaylistUI(Array.isArray(steps) ? steps : []);
+  } catch(_e){
+    setPlaylistUI([]);
+  }
 }
 
 function gather(){
@@ -1025,10 +1284,15 @@ function gather(){
     colorD:to24(el('colorD').value),
     paletteCount:+el('paletteCount').value,
     count:[+el('c0').value,+el('c1').value,+el('c2').value,+el('c3').value],
-    reverse:reverse, // NEW: per-channel direction
+    reverse:reverse,
     resumeOnBoot:(el('resume').value==='true'),
     enableCpu:el('smbusCpu').checked,
-    enableFan:el('smbusFan').checked
+    enableFan:el('smbusFan').checked,
+
+    // NEW
+    masterOff: el('masterOff').checked,
+    customLoop: el('customLoop').checked,
+    customSeq: (el('customSeq').value || "[]"), // kept in sync by the visual editor
   };
 }
 
@@ -1086,8 +1350,179 @@ bind('paletteCount', () => {
 
 // Live preview for the rest
 ['brightness','speed','intensity','width','colorA','colorB','colorC','colorD','resume','smbusCpu','smbusFan',
- 'rev0','rev1','rev2','rev3','c0','c1','c2','c3']
+ 'rev0','rev1','rev2','rev3','c0','c1','c2','c3',
+ 'masterOff','customLoop']
   .forEach(id => bind(id, preview));
+
+// ------------ Custom Playlist UI (visual builder) ------------
+function stepTemplate() {
+  // A row with all fields the firmware understands; we always include values for predictability
+  return `
+    <div class="step">
+      <div class="grid">
+        <div class="col-3">
+          <label>Mode</label>
+          <select data-f="mode" class="mode-select"></select>
+        </div>
+        <div class="col-3">
+          <label>Duration (ms)</label>
+          <input data-f="dur" class="num" type="number" min="1" max="60000" value="1000">
+        </div>
+        <div class="col-2">
+          <label>Speed</label>
+          <input data-f="speed" class="rng" type="range" min="0" max="255" value="128">
+        </div>
+        <div class="col-2">
+          <label>Intensity</label>
+          <input data-f="intensity" class="rng" type="range" min="0" max="255" value="128">
+        </div>
+        <div class="col-2">
+          <label>Width</label>
+          <input data-f="width" class="rng" type="range" min="1" max="20" value="4">
+        </div>
+
+        <div class="col-2">
+          <label>Palette Size</label>
+          <select data-f="pcnt">
+            <option value="1">1</option>
+            <option value="2" selected>2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+          </select>
+        </div>
+
+        <div class="col-3"><label>Color A</label><input data-f="a" class="clr" type="color" value="#ff0000"></div>
+        <div class="col-3"><label>Color B</label><input data-f="b" class="clr" type="color" value="#ffa000"></div>
+        <div class="col-3"><label>Color C</label><input data-f="c" class="clr" type="color" value="#00ff00"></div>
+        <div class="col-3"><label>Color D</label><input data-f="d" class="clr" type="color" value="#0000ff"></div>
+      </div>
+      <div class="btn-row">
+        <button type="button" data-act="up" class="btn-xs">↑ Up</button>
+        <button type="button" data-act="down" class="btn-xs">↓ Down</button>
+        <button type="button" data-act="dup" class="btn-xs">Duplicate</button>
+        <button type="button" data-act="del" class="btn-xs">Delete</button>
+      </div>
+    </div>
+  `;
+}
+
+function makeModeOptions(sel){
+  sel.innerHTML = MODE_LABELS.map((label, i) => `<option value="${i}">${label}</option>`).join('');
+  // Note: mode 14 = Custom is not for steps; we leave it out on purpose
+}
+
+function rowToStep(row){
+  const q = s => row.querySelector(s);
+  return {
+    mode: +q('[data-f=mode]').value,
+    duration: Math.max(1, Math.min(60000, +q('[data-f=dur]').value || 1000)),
+    speed: +q('[data-f=speed]').value,
+    intensity: +q('[data-f=intensity]').value,
+    width: +q('[data-f=width]').value,
+    paletteCount: +q('[data-f=pcnt]').value,
+    colorA: to24(q('[data-f=a]').value),
+    colorB: to24(q('[data-f=b]').value),
+    colorC: to24(q('[data-f=c]').value),
+    colorD: to24(q('[data-f=d]').value),
+  };
+}
+
+function applyStepToRow(row, s){
+  const q = sel => row.querySelector(sel);
+  makeModeOptions(q('[data-f=mode]'));
+  q('[data-f=mode]').value = (s.mode ?? 0);
+  q('[data-f=dur]').value = (s.duration ?? 1000);
+  q('[data-f=speed]').value = (s.speed ?? 128);
+  q('[data-f=intensity]').value = (s.intensity ?? 128);
+  q('[data-f=width]').value = (s.width ?? 4);
+  q('[data-f=pcnt]').value = (s.paletteCount ?? 2);
+  q('[data-f=a]').value = hex24(s.colorA ?? 0xFF0000);
+  q('[data-f=b]').value = hex24(s.colorB ?? 0xFFA000);
+  q('[data-f=c]').value = hex24(s.colorC ?? 0x00FF00);
+  q('[data-f=d]').value = hex24(s.colorD ?? 0x0000FF);
+}
+
+function syncHiddenFromUI(){
+  const rows = Array.from(document.querySelectorAll('#plist .step'));
+  const steps = rows.map(rowToStep);
+  el('customSeq').value = JSON.stringify(steps);
+}
+
+function attachRowActions(row){
+  const plist = el('plist');
+  const act = (sel, fn) => row.querySelector(sel).addEventListener('click', fn);
+  act('[data-act=del]', () => { row.remove(); syncHiddenFromUI(); preview(); });
+  act('[data-act=dup]', () => {
+    const clone = row.cloneNode(true);
+    plist.insertBefore(clone, row.nextSibling);
+    // reattach listeners and keep values
+    attachRowEvents(clone);
+    syncHiddenFromUI(); preview();
+  });
+  act('[data-act=up]', () => {
+    const prev = row.previousElementSibling;
+    if (prev) plist.insertBefore(row, prev);
+    syncHiddenFromUI(); preview();
+  });
+  act('[data-act=down]', () => {
+    const next = row.nextElementSibling;
+    if (next) plist.insertBefore(next, row);
+    syncHiddenFromUI(); preview();
+  });
+}
+
+function attachRowEvents(row){
+  // inputs that affect JSON/preview
+  row.querySelectorAll('input,select').forEach(n => {
+    const ev = (n.tagName === 'SELECT' || n.type === 'checkbox') ? 'change' : 'input';
+    n.addEventListener(ev, () => { syncHiddenFromUI(); preview(); });
+  });
+  attachRowActions(row);
+}
+
+function addStepRow(step){
+  const wrap = document.createElement('div');
+  wrap.innerHTML = stepTemplate();
+  const row = wrap.firstElementChild;
+  applyStepToRow(row, step || {});
+  el('plist').appendChild(row);
+  attachRowEvents(row);
+}
+
+function setPlaylistUI(steps){
+  const plist = el('plist');
+  plist.innerHTML = '';
+  const arr = (Array.isArray(steps) && steps.length) ? steps : [ { mode:0, duration:1000 } ];
+  arr.forEach(s => addStepRow(s));
+  syncHiddenFromUI();
+}
+
+// Add/Clear buttons for playlist
+document.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'addStep') {
+    // Seed new step from current global controls so it feels intuitive
+    const step = {
+      mode: 0,
+      duration: 1000,
+      speed: +el('speed').value || 128,
+      intensity: +el('intensity').value || 128,
+      width: +el('width').value || 4,
+      paletteCount: +el('paletteCount').value || 2,
+      colorA: to24(el('colorA').value),
+      colorB: to24(el('colorB').value),
+      colorC: to24(el('colorC').value),
+      colorD: to24(el('colorD').value),
+    };
+    addStepRow(step);
+    syncHiddenFromUI(); preview();
+  }
+  if (e.target && e.target.id === 'clearSteps') {
+    el('plist').innerHTML = '';
+    setPlaylistUI([]); // inserts one default step
+    syncHiddenFromUI(); preview();
+  }
+});
+
 
 // Buttons
 document.getElementById('save').addEventListener('click',save);
@@ -1102,7 +1537,7 @@ load();
 void begin(const RGBCtrlPins& pins) {
   PINS = pins;
 
-  // Bind pins/length, then init
+  // Bind pins/length, then init (start at 0 brightness so fade begins from black)
   strip1.updateLength(MAX_PER_CH); strip1.setPin(PINS.ch1);
   strip2.updateLength(MAX_PER_CH); strip2.setPin(PINS.ch2);
   strip3.updateLength(MAX_PER_CH); strip3.setPin(PINS.ch3);
@@ -1111,17 +1546,26 @@ void begin(const RGBCtrlPins& pins) {
   for (uint8_t s=0;s<NUM_CH;++s) {
     STRIPS[s]->begin();
     STRIPS[s]->clear();
-    STRIPS[s]->setBrightness(CFG.brightness);
+    STRIPS[s]->setBrightness(0);   // start dark
     STRIPS[s]->show();
   }
-  lastAppliedBrightness = CFG.brightness;
+  lastAppliedBrightness = 0;
 
   memset(heat, 0, sizeof(heat));
 
   // Load the LAST SAVED preferences from NVS on boot
   loadConfig();
-  applyConfig();       // apply brightness and counts
-  renderFrame();       // show the active mode immediately
+  applyConfig();  // applies counts etc. (we will override brightness below)
+
+  // Arm boot fade to target brightness
+  bootFadeTarget   = CFG.brightness;
+  bootFadeStartMs  = millis();
+  bootFadeActive   = true;
+  for (uint8_t s=0; s<NUM_CH; ++s) STRIPS[s]->setBrightness(0);
+  lastAppliedBrightness = 0;
+
+  // Render once; showRing() will apply the fade ramp
+  renderFrame();
 }
 
 void attachWeb(AsyncWebServer& server, const char* basePath) {
