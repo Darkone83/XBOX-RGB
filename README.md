@@ -94,6 +94,22 @@ Designed around **ESP32-S3-Zero** (or similar ESP32-S3 boards).
 
 ---
 
+## Pinouts
+
+CH1 - 3:
+
+<img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/CH1-3.png">
+
+Ch4 - 6:
+
+<img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/CH4-6.png">
+
+XSMB:
+
+<img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/XSMB.png">
+
+---
+
 ## Web UI
 
 - Visit **`/config`** on the device to control animations.  
