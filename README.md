@@ -23,6 +23,7 @@ The web UI previews changes live and saves them to flash (NVS).
 
 - ✨ **12 animation modes** (see below) with live preview
 - 🔆 Global **brightness** (1–255)
+-  💡 **Power on fade in** slow but gentle boot fdade in
 - ⚙️ Per-mode controls: **Speed**, **Intensity**, **Width/Gap**, **Color A / Color B**
 - 🧭 **Sane orientation & sync**: effects start at **CH1 (Front)** and flow clockwise **CH1→CH2→CH3→CH4**; all “phase” effects are synchronized
 - 🪩 **Adjustable Strip length** CH1 - 4 can support up to 50 LEDs configurable from the webui
