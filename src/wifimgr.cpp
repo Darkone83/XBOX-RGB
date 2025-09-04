@@ -69,6 +69,13 @@ static void addPortalRoutesOnce() {
   if (portalRoutesAdded) return;
   portalRoutesAdded = true;
 
+  // Small ping endpoint we can use to probe device reachability
+  server.on("/ping", HTTP_GET, [](AsyncWebServerRequest *request){
+    AsyncWebServerResponse* resp = request->beginResponse(200, "text/plain", "ok");
+    resp->addHeader("Cache-Control", "no-store");
+    request->send(resp);
+  });
+
   // ---------- Portal UI ----------
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     String page = R"HTML(
@@ -76,21 +83,30 @@ static void addPortalRoutesOnce() {
 <html>
 <head>
   <title>WiFi Setup</title>
-  <meta name="viewport" content="width=320,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <style>
-    body {background:#111;color:#EEE;font-family:system-ui,Segoe UI,Roboto,Arial;margin:0}
-    .container {max-width:340px;margin:24px auto;background:#222;padding:1.2em;border-radius:10px;box-shadow:0 8px 20px #0008;}
+    :root{--bg:#111;--card:#222;--ink:#EEE;--mut:#AAB;--pri:#299a2c;--warn:#a22;--link:#9ec1ff}
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body {background:var(--bg);color:var(--ink);font-family:system-ui,Segoe UI,Roboto,Arial;margin:0}
+    .wrap{min-height:100%;display:flex;align-items:center;justify-content:center;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom)}
+    .container {width:100%;max-width:420px;margin:16px auto;background:var(--card);padding:16px;border-radius:12px;box-shadow:0 8px 20px #0008;}
     h1 {margin:0 0 .6em; font-size:1.6em}
-    input,select,button {width:100%;box-sizing:border-box;margin:.6em 0;padding:.6em;font-size:1em;border-radius:7px;border:1px solid #555;background:#111;color:#EEE}
-    .btn-primary {background:#299a2c;border:0;color:white}
-    .btn-danger {background:#a22;border:0;color:white}
+    label{display:block;margin-top:8px;color:var(--mut);font-size:.95em}
+    input,select,button {width:100%;margin:.5em 0;padding:.75em .8em;font-size:1em;border-radius:9px;border:1px solid #555;background:#111;color:var(--ink)}
+    button{cursor:pointer}
+    .btn-primary {background:var(--pri);border:0;color:white}
+    .btn-danger {background:var(--warn);border:0;color:white}
     .btn-ota {background:#265aa5;border:0;color:white}
     .btn-config {background:#7a3ef0;border:0;color:white}
     .row {display:grid;grid-template-columns:1fr;gap:.6em}
-    .status {margin-top:8px;opacity:.85}
+    .status {margin-top:8px;opacity:.9;font-size:.95em}
+    .links{display:flex;gap:8px;flex-wrap:wrap}
+    .links a{color:var(--link);text-decoration:none}
   </style>
 </head>
 <body>
+  <div class="wrap">
   <div class="container">
     <h1>XBOX RGB Setup</h1>
     <div class="row">
@@ -103,14 +119,17 @@ static void addPortalRoutesOnce() {
       <input type="password" id="pass" placeholder="WiFi Password">
       <button type="button" onclick="save()" class="btn-primary">Connect & Save</button>
       <button type="button" onclick="forget()" class="btn-danger">Forget WiFi</button>
-      <button type="button" onclick="window.location='/ota'" class="btn-ota">OTA Update</button>
-      <button type="button" onclick="window.location='/config'" class="btn-config">Config</button>
+      <div class="links">
+        <button type="button" onclick="window.location='/ota'" class="btn-ota">OTA Update</button>
+        <button type="button" onclick="window.location='/config'" class="btn-config">Open Config</button>
+      </div>
       <div class="status" id="status">Status: ...</div>
     </div>
   </div>
+  </div>
 <script>
   function scan() {
-    fetch('/scan').then(r => r.json()).then(list => {
+    fetch('/scan',{cache:'no-store'}).then(r => r.json()).then(list => {
       let dd = document.getElementById('ssidDropdown');
       dd.innerHTML = '';
       let def = document.createElement('option');
@@ -133,7 +152,7 @@ static void addPortalRoutesOnce() {
       dd.appendChild(opt);
     });
   }
-  setInterval(scan, 2500);
+  setInterval(scan, 3000);
   window.onload = scan;
 
   function save() {
@@ -141,12 +160,14 @@ static void addPortalRoutesOnce() {
     let pass = document.getElementById('pass').value;
     fetch('/save',{
       method:'POST',
-      headers:{'Content-Type':'application/json'},
+      headers:{'Content-Type':'application/json','Cache-Control':'no-store'},
       body:JSON.stringify({ssid:ssid,pass:pass})
-    }).then(r=>r.text()).then(t=>{ document.getElementById('status').innerText=t; });
+    }).then(r=>r.text()).then(t=>{ document.getElementById('status').innerText=t; }).catch(()=>{
+      document.getElementById('status').innerText='Error sending credentials';
+    });
   }
   function forget() {
-    fetch('/forget').then(r=>r.text()).then(t=>{
+    fetch('/forget',{cache:'no-store'}).then(r=>r.text()).then(t=>{
       document.getElementById('status').innerText=t;
       document.getElementById('ssid').value='';
       document.getElementById('pass').value='';
@@ -156,37 +177,140 @@ static void addPortalRoutesOnce() {
 </body>
 </html>
 )HTML";
-    request->send(200, "text/html", page);
+    AsyncWebServerResponse* resp = request->beginResponse(200, "text/html", page);
+    resp->addHeader("Cache-Control", "no-store");
+    request->send(resp);
   });
 
-  // ---------- OTA PAGE (simple & robust) ----------
+  // ---------- OTA PAGE (progress + robust layout) ----------
   server.on("/ota", HTTP_GET, [](AsyncWebServerRequest *request){
     static const char kPage[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>OTA Update</title>
 <style>
-  body{background:#111;color:#EEE;font-family:system-ui,Segoe UI,Roboto,Arial;margin:0}
-  .box{max-width:360px;margin:32px auto;background:#222;padding:18px;border-radius:10px;box-shadow:0 8px 20px #0008}
-  h2{margin:0 0 12px} input,button{width:100%;margin:.5rem 0;padding:.6rem;border-radius:6px;border:1px solid #555;background:#111;color:#EEE}
-  button{background:#2563eb;color:#fff;border:0}
-  a{display:inline-block;margin-top:10px;color:#9ec1ff}
+  :root{--bg:#111;--card:#222;--ink:#EEE;--mut:#AAB;--btn:#2563eb;--ok:#2ea043;--err:#d32}
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--ink);font-family:system-ui,Segoe UI,Roboto,Arial;margin:0}
+  .wrap{min-height:100%;display:flex;align-items:center;justify-content:center;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom)}
+  .box{width:100%;max-width:520px;margin:16px auto;background:var(--card);padding:18px 16px;border-radius:12px;box-shadow:0 8px 20px #0008}
+  h2{margin:0 0 12px}
+  .row{display:grid;grid-template-columns:1fr;gap:10px}
+  input[type=file],button{width:100%;margin:.25rem 0;padding:.7rem .8rem;border-radius:9px;border:1px solid #555;background:#111;color:var(--ink);font-size:1rem}
+  button{background:var(--btn);border:0;color:#fff;cursor:pointer}
+  .links{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .links a, .links button{flex:1}
+  .status{margin-top:10px;color:var(--mut)}
+  .bar{height:12px;background:#0c1222;border:1px solid #334; border-radius:999px; overflow:hidden}
+  .fill{height:100%;width:0%}
+  .ok{background:linear-gradient(90deg,#28a745,#3ddc84)}
+  .up{background:linear-gradient(90deg,#4c7cff,#7aa4ff)}
+  .err{background:linear-gradient(90deg,#d32,#f55)}
+  .msg{margin-top:8px;font-size:.95rem}
 </style></head>
-<body><div class="box">
-  <h2>OTA Update</h2>
-  <form method="POST" action="/update" enctype="multipart/form-data">
-    <input type="file" name="firmware" accept=".bin,.bin.gz" required>
-    <button type="submit">Upload & Flash</button>
-  </form>
-  <a href="/">⟵ Back to WiFi Setup</a>
-  <a href="/config">Open Config</a>
-</div></body></html>
+<body>
+<div class="wrap">
+  <div class="box">
+    <h2>OTA Update</h2>
+    <div class="row">
+      <input id="fw" type="file" accept=".bin,.bin.gz">
+      <button id="go">Upload & Flash</button>
+      <div class="bar"><div id="fill" class="fill up"></div></div>
+      <div id="msg" class="msg">Select a firmware <code>.bin</code> (or <code>.bin.gz</code>) and click “Upload & Flash”.</div>
+      <div class="links">
+        <button onclick="location.href='/'">⟵ Back to WiFi Setup</button>
+        <button onclick="location.href='/config'">Open Config</button>
+      </div>
+      <div id="status" class="status"></div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  const fw   = document.getElementById('fw');
+  const btn  = document.getElementById('go');
+  const fill = document.getElementById('fill');
+  const msg  = document.getElementById('msg');
+  const status = document.getElementById('status');
+
+  function setFill(p, cls){
+    fill.style.width = (Math.max(0,Math.min(100,p))|0) + '%';
+    fill.className = 'fill ' + (cls||'up');
+  }
+
+  function pingUntilUp(path, cb){
+    let tries = 0;
+    const t = setInterval(()=>{
+      fetch(path, {cache:'no-store'}).then(r=>{
+        if (r.ok) { clearInterval(t); cb(true); }
+      }).catch(()=>{ /* ignore until it comes back */ });
+      if (++tries > 180) { clearInterval(t); cb(false); } // ~3 min
+    }, 1000);
+  }
+
+  btn.onclick = function(){
+    const f = fw.files && fw.files[0];
+    if(!f){ msg.textContent = 'Please select a firmware file first.'; return; }
+
+    msg.textContent = 'Uploading...';
+    status.textContent = '';
+    setFill(0, 'up');
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/update', true);
+    xhr.responseType = 'text';
+
+    xhr.upload.onprogress = function(ev){
+      if (ev.lengthComputable) {
+        const pc = ev.total ? (ev.loaded * 100 / ev.total) : 0;
+        setFill(pc, 'up');
+      }
+    };
+
+    xhr.onerror = function(){
+      setFill(100, 'err');
+      msg.textContent = 'Upload failed (network error).';
+    };
+
+    xhr.onload = function(){
+      const ok = (xhr.status >= 200 && xhr.status < 300);
+      if (ok && xhr.responseText && xhr.responseText.toLowerCase().indexOf('update complete') !== -1) {
+        setFill(100, 'ok');
+        msg.textContent = 'Flashed OK. Rebooting device...';
+        status.textContent = 'Waiting for device to come back online...';
+        // After firmware applies, device reboots. Poll /ping to detect it’s up again.
+        pingUntilUp('/ping', function(up){
+          if (up) {
+            status.textContent = 'Device is back online. You may open Config.';
+          } else {
+            status.textContent = 'Device did not respond in time. Power-cycle if needed.';
+          }
+        });
+      } else {
+        setFill(100, 'err');
+        msg.textContent = 'Flash failed.';
+        status.textContent = xhr.responseText || ('HTTP '+xhr.status);
+      }
+    };
+
+    const form = new FormData();
+    form.append('firmware', f, f.name);
+    xhr.send(form);
+  };
+})();
+</script>
+</body></html>
 )HTML";
-    request->send(200, "text/html", kPage);
+    AsyncWebServerResponse* resp = request->beginResponse(200, "text/html", kPage);
+    resp->addHeader("Cache-Control", "no-store");
+    request->send(resp);
   });
 
-  // ---------- OTA FLASH (chunk-safe) ----------
-  server.on("/update", HTTP_POST,
+  // ---------- OTA FLASH (chunk-safe + clear status text) ----------
+  server.on(
+    "/update",
+    HTTP_POST,
     [](AsyncWebServerRequest *request) {
       // reply will be sent from upload handler on 'final'
     },
@@ -215,16 +339,16 @@ static void addPortalRoutesOnce() {
         bool ok = !hadError && Update.end(true); // set as boot partition
         if (!ok) Update.printError(Serial);
 
-        AsyncWebServerResponse *res = request->beginResponse(
-          ok ? 200 : 500, "text/plain",
-          ok ? "Update complete. Rebooting..." : "Update failed. See serial log."
-        );
+        const char* body = ok ? "Update complete. Rebooting..." : "Update failed. See serial log.";
+        AsyncWebServerResponse *res = request->beginResponse(ok ? 200 : 500, "text/plain", body);
+        res->addHeader("Cache-Control", "no-store");
         res->addHeader("Connection", "close");
         request->send(res);
 
         Serial.printf("[OTA] %s (%s)\n", ok ? "Success" : "Failed", filename.c_str());
         if (ok) {
-          delay(600); // let HTTP response flush
+          // Give the TCP stack some time to flush before reboot
+          delay(800);
           ESP.restart();
         }
       }
@@ -240,7 +364,9 @@ static void addPortalRoutesOnce() {
       stat = "Connecting to " + ssid + "...";
     else
       stat = "In portal mode";
-    request->send(200, "text/plain", stat);
+    AsyncWebServerResponse* resp = request->beginResponse(200, "text/plain", stat);
+    resp->addHeader("Cache-Control", "no-store");
+    request->send(resp);
   });
 
   // ---------- Connect (GET) ----------
@@ -259,7 +385,9 @@ static void addPortalRoutesOnce() {
     WiFi.mode(WIFI_AP_STA);
     delay(100);
     WiFi.begin(ssid.c_str(), password.c_str());
-    request->send(200, "text/plain", "Connecting to: " + ssid);
+    AsyncWebServerResponse* resp = request->beginResponse(200, "text/plain", "Connecting to: " + ssid);
+    resp->addHeader("Cache-Control", "no-store");
+    request->send(resp);
   });
 
   // ---------- Save creds (POST JSON body) ----------
@@ -285,7 +413,9 @@ static void addPortalRoutesOnce() {
       state = State::CONNECTING;
       connectAttempts = 1;
       WiFi.begin(newSsid.c_str(), newPass.c_str());
-      request->send(200, "text/plain", "Connecting to: " + newSsid);
+      AsyncWebServerResponse* resp = request->beginResponse(200, "text/plain", "Connecting to: " + newSsid);
+      resp->addHeader("Cache-Control", "no-store");
+      request->send(resp);
       Serial.printf("[WiFiMgr] Received new creds. SSID: %s\n", newSsid.c_str());
     }
   );
@@ -341,7 +471,9 @@ static void addPortalRoutesOnce() {
       json += "\"" + lastScanResults[i] + "\"";
     }
     json += "]";
-    request->send(200, "application/json", json);
+    AsyncWebServerResponse* resp = request->beginResponse(200, "application/json", json);
+    resp->addHeader("Cache-Control", "no-store");
+    request->send(resp);
   });
 
   // ---------- Forget ----------
@@ -350,12 +482,16 @@ static void addPortalRoutesOnce() {
     ssid = ""; password = "";
     WiFi.disconnect();
     state = State::PORTAL;
-    request->send(200, "text/plain", "WiFi credentials cleared.");
+    AsyncWebServerResponse* resp = request->beginResponse(200, "text/plain", "WiFi credentials cleared.");
+    resp->addHeader("Cache-Control", "no-store");
+    request->send(resp);
   });
 
   // ---------- Captive portal helpers ----------
   auto cp = [](AsyncWebServerRequest *r){
-    r->send(200, "text/html", "<meta http-equiv='refresh' content='0; url=/' />");
+    AsyncWebServerResponse* resp = r->beginResponse(200, "text/html", "<meta http-equiv='refresh' content='0; url=/' />");
+    resp->addHeader("Cache-Control", "no-store");
+    r->send(resp);
   };
   server.on("/generate_204", HTTP_GET, cp);
   server.on("/hotspot-detect.html", HTTP_GET, cp);
