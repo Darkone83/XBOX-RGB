@@ -2,7 +2,7 @@
 # XBOX RGB Control – Desktop controller for RGBCtrl firmware (v1.6.x)
 # - Auto-discovers devices via UDP broadcast
 # - Mirrors Web UI controls 1:1 (incl. per-channel Reverse, Master Off, Custom Playlist)
-# - UDP preview/save/reset/get + HTTP fallback to /config/api/*
+# - UDP preview/save/reset/get + HTTP fallback to /config/api/* (LED) and /config/smbus/api/* (SMBus)
 # - Live preview with debounce on change
 #
 # Deps: pip install PySide6 requests
@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
 APP_NAME = "XBOX RGB Control"
 ICON_PATH = "dc.ico"
 DEFAULT_UDP_PORT = 7777
-HTTP_BASE_TEMPLATE = "http://{ip}/config/api"
+# IMPORTANT: point HTTP base at the host root; use full paths per endpoint
+HTTP_BASE_TEMPLATE = "http://{ip}"
 
 # ------------------- Firmware mirrors ---------------------
 MODES = [
@@ -195,18 +196,22 @@ class Transport(object):
     def http_get(self, path):
         import requests
         base = HTTP_BASE_TEMPLATE.format(ip=self.ip)
-        r = requests.get(base + path, timeout=2.5)
+        params = {"key": self.psk} if self.psk else None
+        r = requests.get(base + path, timeout=2.5, params=params)
         r.raise_for_status()
         return r.text
 
     def http_post(self, path, body):
         import requests
         base = HTTP_BASE_TEMPLATE.format(ip=self.ip)
-        r = requests.post(base + path, json=body, timeout=3.0)
+        params = {"key": self.psk} if self.psk else None
+        r = requests.post(base + path, json=body, params=params, timeout=3.0)
         r.raise_for_status()
         return r.text
 
+    # ---- LED config (matches WebUI endpoints under /config/api/...) ----
     def get_config(self):
+        # Try UDP first
         if self.use_udp and self.target_ok():
             try:
                 resp = self.udp_send_recv({"op":"get"}, expect_reply=True)
@@ -215,8 +220,9 @@ class Transport(object):
                     return j.get("cfg", j)
             except Exception:
                 pass
+        # HTTP fallback
         try:
-            txt = self.http_get("/ledconfig")
+            txt = self.http_get("/config/api/ledconfig")
             return json.loads(txt)
         except Exception:
             return default_cfg()
@@ -229,7 +235,7 @@ class Transport(object):
             except Exception:
                 pass
         try:
-            self.http_post("/ledpreview", cfg)
+            self.http_post("/config/api/ledpreview", cfg)
             return True
         except Exception:
             return False
@@ -242,7 +248,7 @@ class Transport(object):
             except Exception:
                 pass
         try:
-            self.http_post("/ledsave", cfg)
+            self.http_post("/config/api/ledsave", cfg)
             return True
         except Exception:
             return False
@@ -255,10 +261,20 @@ class Transport(object):
             except Exception:
                 pass
         try:
-            self.http_post("/ledreset", {})
+            self.http_post("/config/api/ledreset", {})
             return True
         except Exception:
             return False
+
+    # ---- SMBus flags/guard (matches WebUI under /config/smbus/api/...) ----
+    def smbus_get_flags(self):
+        # Returns dict like {"cpu":bool,"fan":bool,"savedCpu":bool,"savedFan":bool,"guarded":bool,"guardReason":"TypeD",...}
+        txt = self.http_get("/config/smbus/api/flags")
+        return json.loads(txt)
+
+    def smbus_set_flags(self, cpu: bool, fan: bool):
+        txt = self.http_post("/config/smbus/api/flags", {"cpu": bool(cpu), "fan": bool(fan)})
+        return json.loads(txt)
 
 # ------------------- Color control widget -----------------
 class ColorField(QWidget):
@@ -326,6 +342,7 @@ class MainWindow(QWidget):
         self.transport = Transport()
         self.cfg = default_cfg()
         self.devices: List[Device] = []
+        self._smbus_guarded = False  # track SMBus guard state
 
         self._build_ui()
         self._wire_signals()
@@ -538,8 +555,10 @@ class MainWindow(QWidget):
 
         self.paletteCount.currentIndexChanged.connect(self._palette_changed)
         self.resume.currentIndexChanged.connect(self._value_changed)
-        self.smbusCpu.stateChanged.connect(self._value_changed)
-        self.smbusFan.stateChanged.connect(self._value_changed)
+
+        # SMBus flags: apply immediately via API (WebUI behavior)
+        self.smbusCpu.stateChanged.connect(self._set_smbus_flags)
+        self.smbusFan.stateChanged.connect(self._set_smbus_flags)
 
         # Custom playlist changes
         self.customLoop.stateChanged.connect(self._value_changed)
@@ -626,6 +645,61 @@ class MainWindow(QWidget):
         self._debounce.start()
 
     # --------------- Device I/O ---------------------------
+    def _refresh_smbus_from_device(self):
+        """Fetch SMBus flags/guard and reflect in UI like the WebUI."""
+        try:
+            flags = self.transport.smbus_get_flags()
+        except Exception:
+            # If the endpoint isn't present, leave UI enabled and fall back to cfg values.
+            self._smbus_guarded = False
+            return
+
+        # saved* reflect persisted toggles; cpu/fan may be runtime/guarded view
+        saved_cpu = flags.get("savedCpu")
+        saved_fan = flags.get("savedFan")
+        if saved_cpu is None:
+            saved_cpu = self.cfg.get("enableCpu", True)
+        if saved_fan is None:
+            saved_fan = self.cfg.get("enableFan", True)
+
+        # Update UI without retriggering writes
+        self.smbusCpu.blockSignals(True)
+        self.smbusFan.blockSignals(True)
+        self.smbusCpu.setChecked(bool(saved_cpu))
+        self.smbusFan.setChecked(bool(saved_fan))
+        self.smbusCpu.blockSignals(False)
+        self.smbusFan.blockSignals(False)
+
+        self._smbus_guarded = bool(flags.get("guarded", False))
+        guard_reason = flags.get("guardReason", "Type-D")
+        # Disable toggles (and reflect state) when guarded
+        self.smbusCpu.setEnabled(not self._smbus_guarded)
+        self.smbusFan.setEnabled(not self._smbus_guarded)
+        if self._smbus_guarded:
+            self.status.setText(f"status: SMBus guarded by {guard_reason}")
+        else:
+            self.status.setText("status: ready")
+
+    def _set_smbus_flags(self, *_):
+        """Apply SMBus flags immediately via API; mirror WebUI behavior."""
+        if not self.transport.target_ok():
+            return
+        if self._smbus_guarded:
+            # Reflect guard state and revert UI back to saved values
+            self._refresh_smbus_from_device()
+            return
+        try:
+            resp = self.transport.smbus_set_flags(self.smbusCpu.isChecked(), self.smbusFan.isChecked())
+            if resp.get("guarded"):
+                self._smbus_guarded = True
+                self.smbusCpu.setEnabled(False)
+                self.smbusFan.setEnabled(False)
+                self.status.setText(f"status: SMBus guarded by {resp.get('guardReason','Type-D')}")
+            else:
+                self.status.setText("status: SMBus flags applied")
+        except Exception as e:
+            self.status.setText(f"status: SMBus flag error: {e}")
+
     def reload_from_device(self):
         if not self.transport.target_ok():
             self.status.setText("status: no device target")
@@ -634,6 +708,7 @@ class MainWindow(QWidget):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             cfg = self.transport.get_config()
+            # force mode sanity
             m = cfg.get("mode", 4)
             if not isinstance(m, int) or m < 0 or m > 14:
                 cfg["mode"] = 4  # Rainbow default
@@ -644,7 +719,8 @@ class MainWindow(QWidget):
             self.footer.setText(f"{cpy}" + (f"  •  v{ver}" if ver else ""))
 
             self._cfg_to_ui(cfg)
-            self.status.setText("status: ready")
+            # After LED cfg, refresh SMBus/guard like WebUI
+            self._refresh_smbus_from_device()
         except Exception as e:
             self.status.setText("status: error loading")
             QMessageBox.warning(self, "Load Failed", str(e))
@@ -714,6 +790,9 @@ class MainWindow(QWidget):
         self.rev3.setChecked(bool(rev[3] if len(rev)>3 else False))
 
         self.resume.setCurrentIndex(1 if self.cfg.get("resumeOnBoot",True) else 0)
+
+        # These are persisted in LED cfg as well, but runtime effect is managed by SMBus flags API.
+        # We still reflect saved preference here; _refresh_smbus_from_device will sync/disable if guarded.
         self.smbusCpu.setChecked(bool(self.cfg.get("enableCpu",True)))
         self.smbusFan.setChecked(bool(self.cfg.get("enableFan",True)))
 
@@ -758,6 +837,7 @@ class MainWindow(QWidget):
                 self.rev3.isChecked(),
             ],
             "resumeOnBoot": (self.resume.currentIndex()==1),
+            # These fields persist preference; runtime control is through /config/smbus/api/flags
             "enableCpu": self.smbusCpu.isChecked(),
             "enableFan": self.smbusFan.isChecked(),
             # NEW:
