@@ -61,6 +61,12 @@ The web UI previews changes live and saves them to flash (NVS).
 
 ---
 
+## Purchase:
+
+<a href="https://www.darkonecustoms.com/store/p/xbox-rgb">Darkone Custsoms</a>
+
+---
+
 ## Hardware
 
 ## Purchasing sources
