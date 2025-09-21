@@ -11,7 +11,7 @@
 
 A custom RGB controller that drives up to **6 WS2812/NeoPixel channels** for original Xbox RGB lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
 
-- **CH1–CH4**: Main decorative LEDs (up to **50 pixels per channel**).  
+- **CH1–CH4**: Main LED ring (up to **50 pixels per channel**).  
 - **CH5**: CPU temperature bar (up to **10 pixels**).  
 - **CH6**: Fan speed bar (up to **10 pixels**).  
 
@@ -97,7 +97,7 @@ Designed around **ESP32-S3-Zero** (or similar ESP32-S3 boards).
 - **SDA** → `IO7`  
 - **SCL** → `IO8`
 
-> If a strip is reversed physically, flip that channel via the `REVERSE[]` flags in `RGBCtrl.cpp`.
+> If a strip is reversed physically, flip that channel via the `REVERSE[]` flags in `RGBCtrl.cpp`, or the WebUi.
 
 ---
 
@@ -124,7 +124,7 @@ XSMB:
 - SMBus toggles (Enable CPU / Enable Fan) live under “Xbox SMBus LEDs”.
 
 **Captive Portal:**  
-On first boot (or after forgetting Wi-Fi) connect to AP **`XBOX RGB Setup`** → it redirects to the setup page. The SSID picker is refreshed and “sticky” to reduce scan failures.
+On first boot (or after forgetting Wi-Fi) connect to AP **`XBOX RGB Setup`** → it redirects to the setup page.
 
 **OTA:**  
 Open **`/ota`**, pick your compiled `.bin`, upload, wait for reboot.
