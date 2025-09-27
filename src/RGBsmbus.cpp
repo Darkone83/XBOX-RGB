@@ -3,10 +3,9 @@
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
 #include <ESPAsyncWebServer.h>
-#include <WiFiUdp.h>   // Type-D guard listener
+#include <WiFiUdp.h>
 
 // === UDP quiet-window hook (no heavy JSON parsing while we touch SMBus) ===
-// (Declared in RGBudp.h; forward-declare here to avoid hard include dependency)
 namespace RGBCtrlUDP { void enterSmbusQuietUs(uint32_t dur_us); }
 
 // Read the toggles saved by RGBCtrl's Web UI (no extra REST needed)
@@ -15,14 +14,58 @@ namespace RGBCtrl {
   bool smbusFanEnabled();
 }
 
+// ==== Local SMBus coordination (built-in; no external poller needed) ====
+#if defined(ARDUINO_ARCH_ESP32)
+  #include "freertos/FreeRTOS.h"
+  #include "freertos/semphr.h"
+#endif
+
+static SemaphoreHandle_t g_smbusMutex = nullptr;
+static volatile uint32_t g_smbusLastMs = 0;
+
+static inline void smbus_init_mutex() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (!g_smbusMutex) g_smbusMutex = xSemaphoreCreateMutex();
+#endif
+}
+static inline void smbus_note_activity() { g_smbusLastMs = millis(); }
+
+// Weak so a future central poller can override with strong defs.
+extern "C" __attribute__((weak)) bool smbus_acquire(uint32_t timeout_ms) {
+  smbus_init_mutex();
+#if defined(ARDUINO_ARCH_ESP32)
+  if (!g_smbusMutex) return true;
+  TickType_t to = timeout_ms ? pdMS_TO_TICKS(timeout_ms) : 0;
+  return xSemaphoreTake(g_smbusMutex, to) == pdTRUE;
+#else
+  (void)timeout_ms; return true;
+#endif
+}
+extern "C" __attribute__((weak)) void smbus_release() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (g_smbusMutex) xSemaphoreGive(g_smbusMutex);
+#endif
+}
+extern "C" __attribute__((weak)) uint32_t smbus_last_activity_ms() {
+  return g_smbusLastMs;  // 0 means "no activity observed"
+}
+
 // ========================= USER CONFIG =========================
 #ifndef RGBSMBUS_PIXEL_TYPE
 #define RGBSMBUS_PIXEL_TYPE (NEO_GRB + NEO_KHZ800)
 #endif
 
-static const uint8_t  BRIGHTNESS       = 160;    // CH5/CH6 bar brightness
-static const uint32_t POLL_INTERVAL_MS = 10000;  // poll every 10s
-static const float    SMOOTH_ALPHA     = 0.35f;  // EMA smoothing
+static const uint8_t  BRIGHTNESS        = 160;    // CH5/CH6 bar brightness
+
+// Cadence: very light on the bus. One RR step ~4s (+ jitter).
+#ifndef RGBSMBUS_POLL_MS
+#define RGBSMBUS_POLL_MS     4000
+#endif
+#ifndef RGBSMBUS_JITTER_MAX_MS
+#define RGBSMBUS_JITTER_MAX_MS  250
+#endif
+
+static const float    SMOOTH_ALPHA      = 0.35f;  // EMA smoothing
 
 // CPU °C thresholds
 static const float CPU_COOL_MAX_C = 25.0f;
@@ -56,39 +99,36 @@ static const uint8_t I2C_XCALIBUR  = 0x70;
 // ===============================================
 
 // ========================= SAFETY KNOBS =========================
-// Prefer STOP-only cycles; RS is opt-in and auto-disabled on Xcalibur/1.6.
 #ifndef RGBSMBUS_ALLOW_RS
 #define RGBSMBUS_ALLOW_RS 0
 #endif
-// I2C clock (Hz). 72 kHz is close to OG SMBus; drop to 50 kHz if needed.
 #ifndef RGBSMBUS_I2C_HZ
 #define RGBSMBUS_I2C_HZ 72000
 #endif
-// Bus idle sampler: wait up to this long for SDA/SCL high, requiring N samples.
 #ifndef RGBSMBUS_WAIT_IDLE_MS
 #define RGBSMBUS_WAIT_IDLE_MS 15
 #endif
 #ifndef RGBSMBUS_IDLE_STABLE
 #define RGBSMBUS_IDLE_STABLE 6
 #endif
-// Quiet windows (extendable if called again while active)
 #ifndef RGBSMBUS_GUARD_PER_ATTEMPT_US
 #define RGBSMBUS_GUARD_PER_ATTEMPT_US 3200
 #endif
 #ifndef RGBSMBUS_GUARD_PER_POLL_US
 #define RGBSMBUS_GUARD_PER_POLL_US 4800
 #endif
-// Gap between samples in a burst
 #ifndef RGBSMBUS_INTER_SAMPLE_US
 #define RGBSMBUS_INTER_SAMPLE_US 180
 #endif
-// Gentle “wedged” recovery after this many *polls* that saw no idle bus
 #ifndef RGBSMBUS_STUCK_POLL_THRESHOLD
 #define RGBSMBUS_STUCK_POLL_THRESHOLD 3
 #endif
-// Treat Type-D presence as active for this many ms after the last beacon
 #ifndef RGBSMBUS_TYPE_D_TTL_MS
 #define RGBSMBUS_TYPE_D_TTL_MS 15000
+#endif
+// Additional quiet window relative to last SMBus activity.
+#ifndef RGBSMBUS_MIN_QUIET_MS
+#define RGBSMBUS_MIN_QUIET_MS 6
 #endif
 // ===============================================================
 
@@ -103,38 +143,46 @@ static uint8_t CH6_COUNT = 5;
 static Adafruit_NeoPixel cpuStrip(5, 1, RGBSMBUS_PIXEL_TYPE);
 static Adafruit_NeoPixel fanStrip(5, 2, RGBSMBUS_PIXEL_TYPE);
 
-static uint32_t lastPoll = 0;
-static float smoothedCpu = 0.0f;
-static float smoothedFan = 0.0f;
+static uint32_t nextPoll     = 0;
+static float    smoothedCpu  = 0.0f;
+static float    smoothedFan  = 0.0f;
 
-// We still keep local copies, but we now *mirror* RGBCtrl flags each poll
 static bool gEnableCPU   = true;
 static bool gEnableFAN   = true;
 
 static bool gIsXcalibur  = false;
-static bool gBoardDetected = false;  // defer probing until safe (and only once)
+static bool gBoardDetected = false;  // probe once, when safe
 
-// track last applied brightness
+// last applied brightness
 static uint8_t lastAppliedBrightnessCpu = 0xFF;
 static uint8_t lastAppliedBrightnessFan = 0xFF;
+
+// Round-robin step: 0=CPU, 1=FAN, 2=idle, 3=idle → repeat
+static uint8_t rr_step = 0;
 
 // -------- Type-D Expansion guard (UDP presence beacon) --------
 static WiFiUDP guardUdp;
 static const uint16_t TYPE_D_PORT = 50502;            // beacons arrive here
 static unsigned long lastTypeDSeen = 0;
 
+static inline unsigned long jitter_ms(unsigned long maxJ) {
+  return (millis() ^ 0xA5A5u) % (maxJ + 1);
+}
+
+static void armNextPoll(uint32_t base_ms = RGBSMBUS_POLL_MS) {
+  nextPoll = millis() + base_ms + jitter_ms(RGBSMBUS_JITTER_MAX_MS);
+}
+
 static void pollTypeD() {
-  // Non-blocking: consume any pending datagrams
   int len = guardUdp.parsePacket();
   while (len > 0) {
     char msg[64];
     int r = guardUdp.read((uint8_t*)msg, (len < 63 ? len : 63));
     msg[r > 0 ? r : 0] = '\0';
-    // Broadcast payload expected: "TYPE_D_ID:6"
     if (strstr(msg, "TYPE_D_ID:6")) {
       lastTypeDSeen = millis();
     }
-    len = guardUdp.parsePacket(); // check next datagram if queued
+    len = guardUdp.parsePacket();
   }
 }
 static inline bool typeDPresent() {
@@ -221,6 +269,13 @@ static bool waitBusIdle(uint8_t sda, uint8_t scl,
   return false;
 }
 
+static inline bool quietSinceLastPollerTouch() {
+  uint32_t last = smbus_last_activity_ms();   // 0 -> no activity / no poller
+  if (last == 0) return true;
+  uint32_t now = millis();
+  return (now - last) >= RGBSMBUS_MIN_QUIET_MS;
+}
+
 static void smbusBreather() {
   delayMicroseconds(150);
   yield();
@@ -243,39 +298,58 @@ static void maybeRecoverWire() {
 static bool readByteSTOP(uint8_t addr7, uint8_t reg, uint8_t& value) {
   RGBCtrlUDP::enterSmbusQuietUs(RGBSMBUS_GUARD_PER_ATTEMPT_US);
   if (!waitBusIdle(PINS.sda, PINS.scl)) return false;
+  if (!quietSinceLastPollerTouch())     return false;
+
+  if (!smbus_acquire(5)) return false;
 
   Wire.beginTransmission(addr7);
   Wire.write(reg);
-  if (Wire.endTransmission(true) != 0) return false;  // STOP
+  int ok = (Wire.endTransmission(true) == 0);
+  if (ok) smbus_note_activity();
   smbusBreather();
 
-  int n = Wire.requestFrom((int)addr7, 1, (int)true); // STOP
-  if (n == 1 && Wire.available()) {
+  int n = 0;
+  if (ok) n = Wire.requestFrom((int)addr7, 1, (int)true); // STOP
+
+  bool good = (ok && n == 1 && Wire.available());
+  if (good) {
     value = Wire.read();
-    smbusBreather();
-    return true;
+    smbus_note_activity();
   }
-  return false;
+
+  smbus_release();
+  if (good) { smbusBreather(); }
+  return good;
 }
 
 // ---------- RS+read (only if allowed & not 1.6) ----------
 static bool readByteRS(uint8_t addr7, uint8_t reg, uint8_t& value) {
-  if (gIsXcalibur || !RGBSMBUS_ALLOW_RS) return false; // disabled for 1.6 or globally
+  if (gIsXcalibur || !RGBSMBUS_ALLOW_RS) return false;
   RGBCtrlUDP::enterSmbusQuietUs(RGBSMBUS_GUARD_PER_ATTEMPT_US);
   if (!waitBusIdle(PINS.sda, PINS.scl)) return false;
+  if (!quietSinceLastPollerTouch())     return false;
+
+  if (!smbus_acquire(5)) return false;
 
   Wire.beginTransmission(addr7);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false; // repeated-start (no STOP)
-  int n = Wire.requestFrom((int)addr7, 1, (int)true); // end with STOP
-  if (n == 1 && Wire.available()) {
-    value = Wire.read();
-    return true;
+  if (Wire.endTransmission(false) != 0) {
+    smbus_release();
+    return false;
   }
-  return false;
+  smbus_note_activity();
+
+  int n = Wire.requestFrom((int)addr7, 1, (int)true); // STOP
+  bool good = (n == 1 && Wire.available());
+  if (good) {
+    value = Wire.read();
+    smbus_note_activity();
+  }
+
+  smbus_release();
+  return good;
 }
 
-// Try STOP first, optional RS second (single attempt)
 static bool readOncePrefStop(uint8_t addr7, uint8_t reg, uint8_t& value) {
   if (readByteSTOP(addr7, reg, value)) return true;
   if (readByteRS(addr7, reg, value))   return true;
@@ -291,7 +365,6 @@ static bool readMedianByte(uint8_t addr7, uint8_t reg, uint8_t& out) {
     return true;
   }
 
-  // Non-1.6: up to 3 single-attempt samples
   uint8_t got = 0, a=0, b=0, c=0;
   for (uint8_t i=0; i<3; ++i) {
     uint8_t v=0;
@@ -304,7 +377,6 @@ static bool readMedianByte(uint8_t addr7, uint8_t reg, uint8_t& out) {
   if (got == 0) return false;
   if (got == 1) { out = a; return true; }
   if (got == 2) { out = uint8_t((a + b)/2); return true; }
-  // got == 3 → median of (a,b,c)
   uint8_t lo = a<b ? a : b;  uint8_t hi = a>b ? a : b;
   out = (c<lo) ? lo : (c>hi ? hi : c);
   return true;
@@ -320,7 +392,7 @@ static bool readCpuCelsius(uint8_t& outC) {
 static bool readFanPercent(uint8_t& outPct) {
   uint8_t v=0;
   if (!readMedianByte(SMC_ADDRESS, REG_FANSPEED, v)) return false;
-  uint16_t pct = (v <= 50) ? (uint16_t)v * 2u : (uint16_t)v; // 0..50 → % (some FW already 0..100)
+  uint16_t pct = (v <= 50) ? (uint16_t)v * 2u : (uint16_t)v; // 0..50 → %
   if (pct > 100) pct = 100;
   outPct = (uint8_t)pct;
   return true;
@@ -328,19 +400,17 @@ static bool readFanPercent(uint8_t& outPct) {
 
 // Probe for encoder (optional)
 static bool probeI2C(uint8_t addr7) {
-  // STOP-only presence probe
   uint8_t dummy;
   return readByteSTOP(addr7, 0x00, dummy);
 }
 
-// Lazy/guarded board probe: only when Type-D NOT present, and only once.
 static void detectBoardLazy() {
   if (gBoardDetected) return;
-  if (typeDPresent()) return;               // strict: no SMBus while Type-D is around
-  RGBCtrlUDP::enterSmbusQuietUs(2000);      // keep consistent with other SMBus ops
-  // Require bus idle before probing; otherwise skip for this poll
+  if (typeDPresent()) return;               // never probe while Type-D is around
+  RGBCtrlUDP::enterSmbusQuietUs(2000);
   if (!waitBusIdle(PINS.sda, PINS.scl)) return;
-  gIsXcalibur = probeI2C(I2C_XCALIBUR);     // single, quick probe
+  if (!quietSinceLastPollerTouch())     return;
+  gIsXcalibur = probeI2C(I2C_XCALIBUR);
   gBoardDetected = true;
 }
 
@@ -381,94 +451,86 @@ void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
   Wire.setTimeOut(20); // keep stalls short to avoid UI hiccups
 #endif
 
-  // Do not probe SMBus here; we’ll detect lazily only when safe.
-  lastPoll = 0;
   smoothedCpu = 0.f; smoothedFan = 0.f;
-
-  // Initialize local flags from RGBCtrl's saved state
   applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
 
   // Start Type-D beacon listener
   guardUdp.begin(TYPE_D_PORT);
+
+  rr_step = 0;
+  nextPoll = 0;
 }
 
-static void updateOnce() {
-  // Mirror UI flags on every cycle (cheap & keeps in sync)
+static void updateOnceRR() {
+  // Mirror UI flags each cycle
   applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
 
-  // Guard: if Type-D is present, avoid bus clash — blank bars and skip SMBus
+  // If Type-D present → never touch SMBus; blanks to indicate guard
   if (typeDPresent()) {
     if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
     if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
   }
 
-  // If both disabled, skip the bus entirely and ensure LEDs are off
+  // If both disabled, ensure LEDs are off and skip the bus entirely
   if (!gEnableCPU && !gEnableFAN) {
     if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
     if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
   }
 
-  // We’re about to talk SMBus (at least one metric enabled, no Type-D):
-  // probe once, safely, and wrap the whole poll in a coarse quiet window.
+  // Safe, light probe once when allowed
   detectBoardLazy();
+
+  // Coarse quiet window for the whole RR step
   RGBCtrlUDP::enterSmbusQuietUs(RGBSMBUS_GUARD_PER_POLL_US);
 
-  // Require idle bus before this poll; if not, skip and maybe gently recover.
-  if (!waitBusIdle(PINS.sda, PINS.scl)) {
+  // Require idle lines AND spacing since last SMBus activity
+  if (!waitBusIdle(PINS.sda, PINS.scl) || !quietSinceLastPollerTouch()) {
     maybeRecoverWire();
-    // Blank bars to indicate temporary skip (no error flash)
+    // show blanks to indicate skip
     if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
     if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
   }
-  // Reset stuck counter on a good idle observation
   s_stuckPolls = 0;
 
+  // Round-robin: only one read per tick to avoid bursts
+  const uint8_t step = (rr_step++) & 0x03;
   bool ok = true;
   int cpuC = -1;
   int fanP = -1;
 
-  if (gEnableCPU) {
-    uint8_t v=0;
-    if (readCpuCelsius(v)) cpuC = (int)v; else ok = false;
-  }
-  if (gEnableFAN) {
-    uint8_t v=0;
-    if (readFanPercent(v)) fanP = (int)v; else ok = false;
+  if (step == 0 && gEnableCPU) {
+    uint8_t v=0; ok = readCpuCelsius(v); if (ok) cpuC = (int)v;
+  } else if (step == 1 && gEnableFAN) {
+    uint8_t v=0; ok = readFanPercent(v); if (ok) fanP = (int)v;
+  } else {
+    // idle steps (2,3) → no SMBus I/O
   }
 
   if (ok) {
-    if (gEnableCPU) {
-      if (cpuC >= 0) {
-        smoothedCpu = SMOOTH_ALPHA * float(cpuC) + (1.f-SMOOTH_ALPHA)*smoothedCpu;
-        drawBar(cpuStrip, lastAppliedBrightnessCpu,
-                CH5_COUNT,
-                barLen(smoothedCpu, CPU_MAX_C, CH5_COUNT),
-                colorForCpu(smoothedCpu));
-      } else {
-        drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
-      }
-    } else {
+    if (cpuC >= 0) {
+      smoothedCpu = SMOOTH_ALPHA * float(cpuC) + (1.f-SMOOTH_ALPHA)*smoothedCpu;
+      drawBar(cpuStrip, lastAppliedBrightnessCpu,
+              CH5_COUNT,
+              barLen(smoothedCpu, CPU_MAX_C, CH5_COUNT),
+              colorForCpu(smoothedCpu));
+    } else if (!gEnableCPU) {
       drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
     }
 
-    if (gEnableFAN) {
-      if (fanP >= 0) {
-        smoothedFan = SMOOTH_ALPHA * float(fanP) + (1.f-SMOOTH_ALPHA)*smoothedFan;
-        drawBar(fanStrip, lastAppliedBrightnessFan,
-                CH6_COUNT,
-                barLen(smoothedFan, FAN_FAST_MAX, CH6_COUNT),
-                colorForFan(smoothedFan));
-      } else {
-        drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
-      }
-    } else {
+    if (fanP >= 0) {
+      smoothedFan = SMOOTH_ALPHA * float(fanP) + (1.f-SMOOTH_ALPHA)*smoothedFan;
+      drawBar(fanStrip, lastAppliedBrightnessFan,
+              CH6_COUNT,
+              barLen(smoothedFan, FAN_FAST_MAX, CH6_COUNT),
+              colorForFan(smoothedFan));
+    } else if (!gEnableFAN) {
       drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     }
   } else {
-    // Error indicator on first pixel of enabled bars
+    // Error blink on first pixel of *enabled* bars
     if (gEnableCPU && CH5_COUNT) {
       cpuStrip.setPixelColor(0,(FAIL_COLOR>>16)&0xFF,(FAIL_COLOR>>8)&0xFF,FAIL_COLOR&0xFF);
       if (lastAppliedBrightnessCpu != BRIGHTNESS) { cpuStrip.setBrightness(BRIGHTNESS); lastAppliedBrightnessCpu = BRIGHTNESS; }
@@ -483,20 +545,19 @@ static void updateOnce() {
 }
 
 void loop() {
-  // Always keep guard presence fresh
   pollTypeD();
 
-  uint32_t now = millis();
-  if (now - lastPoll >= POLL_INTERVAL_MS) {
-    lastPoll = now;
-    updateOnce();
+  const uint32_t now = millis();
+  if (now >= nextPoll) {
+    updateOnceRR();
+    armNextPoll();
   }
 }
 
 // Manual refresh hook
-void refreshNow() { updateOnce(); }
+void refreshNow() { updateOnceRR(); }
 
-// These remain as direct controls if you want to toggle outside RGBCtrl
+// Direct controls
 void setCpuEnabled(bool en) { applyEnableFlags(en, gEnableFAN); }
 void setFanEnabled(bool en) { applyEnableFlags(gEnableCPU, en); }
 bool cpuEnabled() { return gEnableCPU; }
@@ -504,8 +565,7 @@ bool fanEnabled() { return gEnableFAN; }
 
 bool isXcalibur() { return gIsXcalibur; }
 
-// Optional: tiny REST API. Now includes guard info so the Web UI
-// can show that SMBus is temporarily disabled by Type-D presence.
+// Optional: tiny REST API. (Kept as-is; attach from your Web setup if desired.)
 void attachWeb(AsyncWebServer& server, const char* basePath) {
   String base = (basePath && *basePath) ? basePath : "/config/smbus";
   String api  = base + "/api/flags";
@@ -515,7 +575,6 @@ void attachWeb(AsyncWebServer& server, const char* basePath) {
     bool fanSaved = RGBCtrl::smbusFanEnabled();
     bool guarded  = typeDPresent();
 
-    // Effective flags reflect guard
     bool cpuEff = guarded ? false : cpuSaved;
     bool fanEff = guarded ? false : fanSaved;
 
@@ -537,7 +596,6 @@ void attachWeb(AsyncWebServer& server, const char* basePath) {
   },
   nullptr,
   [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t){
-    // Keep compatibility: allows toggling local flags, but guard still applies.
     bool ok = true;
     String body((const char*)data, len);
     body.replace(" ", ""); body.replace("\n", ""); body.replace("\r", "");

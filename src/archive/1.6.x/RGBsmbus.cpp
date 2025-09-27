@@ -1,0 +1,577 @@
+#include "RGBsmbus.h"
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
+#include <ESPAsyncWebServer.h>
+#include <WiFiUdp.h>   // Type-D guard listener
+
+// === UDP quiet-window hook (no heavy JSON parsing while we touch SMBus) ===
+// (Declared in RGBudp.h; forward-declare here to avoid hard include dependency)
+namespace RGBCtrlUDP { void enterSmbusQuietUs(uint32_t dur_us); }
+
+// Read the toggles saved by RGBCtrl's Web UI (no extra REST needed)
+namespace RGBCtrl {
+  bool smbusCpuEnabled();
+  bool smbusFanEnabled();
+}
+
+// ========================= USER CONFIG =========================
+#ifndef RGBSMBUS_PIXEL_TYPE
+#define RGBSMBUS_PIXEL_TYPE (NEO_GRB + NEO_KHZ800)
+#endif
+
+static const uint8_t  BRIGHTNESS       = 160;    // CH5/CH6 bar brightness
+static const uint32_t POLL_INTERVAL_MS = 10000;  // poll every 10s
+static const float    SMOOTH_ALPHA     = 0.35f;  // EMA smoothing
+
+// CPU °C thresholds
+static const float CPU_COOL_MAX_C = 25.0f;
+static const float CPU_WARM_MAX_C = 45.0f;
+static const float CPU_MAX_C      = 65.0f;
+
+// Fan % thresholds
+static const float FAN_SLOW_MAX   = 33.0f;
+static const float FAN_MED_MAX    = 66.0f;
+static const float FAN_FAST_MAX   = 100.0f;
+
+// Colors (0xRRGGBB)
+static const uint32_t CPU_COOL_COLOR = 0x00FF00; // green
+static const uint32_t CPU_WARM_COLOR = 0xFFFF00; // yellow
+static const uint32_t CPU_HOT_COLOR  = 0xFF0000; // red
+
+static const uint32_t FAN_SLOW_COLOR = 0x0066FF; // blue
+static const uint32_t FAN_MED_COLOR  = 0xFFFF00; // yellow
+static const uint32_t FAN_FAST_COLOR = 0xFF7A00; // orange
+
+static const uint32_t FAIL_COLOR     = 0x400000; // dim red on error
+// ===============================================================
+
+// ======== Xbox SMC SMBus (I²C) details =========
+static const uint8_t SMC_ADDRESS   = 0x10; // SMC PIC (7-bit)
+static const uint8_t REG_CPUTEMP   = 0x09; // °C
+static const uint8_t REG_FANSPEED  = 0x10; // 0..50 -> ×2 => %  (some FW returns 0..100)
+
+// Video encoders (7-bit) — probe to identify board family
+static const uint8_t I2C_XCALIBUR  = 0x70;
+// ===============================================
+
+// ========================= SAFETY KNOBS =========================
+// Prefer STOP-only cycles; RS is opt-in and auto-disabled on Xcalibur/1.6.
+#ifndef RGBSMBUS_ALLOW_RS
+#define RGBSMBUS_ALLOW_RS 0
+#endif
+// I2C clock (Hz). 72 kHz is close to OG SMBus; drop to 50 kHz if needed.
+#ifndef RGBSMBUS_I2C_HZ
+#define RGBSMBUS_I2C_HZ 72000
+#endif
+// Bus idle sampler: wait up to this long for SDA/SCL high, requiring N samples.
+#ifndef RGBSMBUS_WAIT_IDLE_MS
+#define RGBSMBUS_WAIT_IDLE_MS 15
+#endif
+#ifndef RGBSMBUS_IDLE_STABLE
+#define RGBSMBUS_IDLE_STABLE 6
+#endif
+// Quiet windows (extendable if called again while active)
+#ifndef RGBSMBUS_GUARD_PER_ATTEMPT_US
+#define RGBSMBUS_GUARD_PER_ATTEMPT_US 3200
+#endif
+#ifndef RGBSMBUS_GUARD_PER_POLL_US
+#define RGBSMBUS_GUARD_PER_POLL_US 4800
+#endif
+// Gap between samples in a burst
+#ifndef RGBSMBUS_INTER_SAMPLE_US
+#define RGBSMBUS_INTER_SAMPLE_US 180
+#endif
+// Gentle “wedged” recovery after this many *polls* that saw no idle bus
+#ifndef RGBSMBUS_STUCK_POLL_THRESHOLD
+#define RGBSMBUS_STUCK_POLL_THRESHOLD 3
+#endif
+// Treat Type-D presence as active for this many ms after the last beacon
+#ifndef RGBSMBUS_TYPE_D_TTL_MS
+#define RGBSMBUS_TYPE_D_TTL_MS 15000
+#endif
+// ===============================================================
+
+namespace RGBsmbus {
+
+static RGBsmbusPins PINS{0,0,7,6};
+
+static uint8_t CH5_COUNT = 5;
+static uint8_t CH6_COUNT = 5;
+
+// CH5 = CPU bar, CH6 = FAN bar
+static Adafruit_NeoPixel cpuStrip(5, 1, RGBSMBUS_PIXEL_TYPE);
+static Adafruit_NeoPixel fanStrip(5, 2, RGBSMBUS_PIXEL_TYPE);
+
+static uint32_t lastPoll = 0;
+static float smoothedCpu = 0.0f;
+static float smoothedFan = 0.0f;
+
+// We still keep local copies, but we now *mirror* RGBCtrl flags each poll
+static bool gEnableCPU   = true;
+static bool gEnableFAN   = true;
+
+static bool gIsXcalibur  = false;
+static bool gBoardDetected = false;  // defer probing until safe (and only once)
+
+// track last applied brightness
+static uint8_t lastAppliedBrightnessCpu = 0xFF;
+static uint8_t lastAppliedBrightnessFan = 0xFF;
+
+// -------- Type-D Expansion guard (UDP presence beacon) --------
+static WiFiUDP guardUdp;
+static const uint16_t TYPE_D_PORT = 50502;            // beacons arrive here
+static unsigned long lastTypeDSeen = 0;
+
+static void pollTypeD() {
+  // Non-blocking: consume any pending datagrams
+  int len = guardUdp.parsePacket();
+  while (len > 0) {
+    char msg[64];
+    int r = guardUdp.read((uint8_t*)msg, (len < 63 ? len : 63));
+    msg[r > 0 ? r : 0] = '\0';
+    // Broadcast payload expected: "TYPE_D_ID:6"
+    if (strstr(msg, "TYPE_D_ID:6")) {
+      lastTypeDSeen = millis();
+    }
+    len = guardUdp.parsePacket(); // check next datagram if queued
+  }
+}
+static inline bool typeDPresent() {
+  return (millis() - lastTypeDSeen) < RGBSMBUS_TYPE_D_TTL_MS;
+}
+
+// ---------- helpers ----------
+static inline float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+static uint32_t lerpColor(uint32_t a, uint32_t b, float t) {
+  t = clampf(t, 0.f, 1.f);
+  uint8_t ar=(a>>16)&0xFF, ag=(a>>8)&0xFF, ab=a&0xFF;
+  uint8_t br=(b>>16)&0xFF, bg=(b>>8)&0xFF, bb=b&0xFF;
+  uint8_t r=uint8_t(ar + (br-ar)*t);
+  uint8_t g=uint8_t(ag + (bg-ag)*t);
+  uint8_t b8=uint8_t(ab + (bb-ab)*t);
+  return (uint32_t(r)<<16)|(uint32_t(g)<<8)|b8;
+}
+static uint32_t colorForCpu(float c) {
+  c = clampf(c, 0.f, CPU_MAX_C);
+  if (c <= CPU_COOL_MAX_C) {
+    float t = (CPU_COOL_MAX_C>0)?(c/CPU_COOL_MAX_C):0.f;
+    return lerpColor(CPU_COOL_COLOR, CPU_WARM_COLOR, t);
+  } else if (c <= CPU_WARM_MAX_C) {
+    float span = CPU_WARM_MAX_C - CPU_COOL_MAX_C;
+    float t = span>0 ? (c-CPU_COOL_MAX_C)/span : 1.f;
+    return lerpColor(CPU_WARM_COLOR, CPU_HOT_COLOR, t);
+  }
+  return CPU_HOT_COLOR;
+}
+static uint32_t colorForFan(float p) {
+  p = clampf(p, 0.f, FAN_FAST_MAX);
+  if (p <= FAN_SLOW_MAX) {
+    float t = (FAN_SLOW_MAX>0)?(p/FAN_SLOW_MAX):0.f;
+    return lerpColor(FAN_SLOW_COLOR, FAN_MED_COLOR, t);
+  } else if (p <= FAN_MED_MAX) {
+    float span = FAN_MED_MAX - FAN_SLOW_MAX;
+    float t = span>0 ? (p-FAN_SLOW_MAX)/span : 1.f;
+    return lerpColor(FAN_MED_COLOR, FAN_FAST_COLOR, t);
+  }
+  return FAN_FAST_COLOR;
+}
+static uint8_t barLen(float val, float maxVal, uint8_t n) {
+  if (maxVal <= 0.f) return 0;
+  float f = clampf(val/maxVal, 0.f, 1.f);
+  int lit = int(f*n + 0.5f);
+  if (lit < 0) lit = 0; if (lit > (int)n) lit = n;
+  return (uint8_t)lit;
+}
+static void drawBar(Adafruit_NeoPixel& strip,
+                    uint8_t& lastBriRef,
+                    uint8_t nleds,
+                    uint8_t lit,
+                    uint32_t rgb24) {
+  const uint8_t r=(rgb24>>16)&0xFF, g=(rgb24>>8)&0xFF, b=rgb24&0xFF;
+
+  for (uint8_t i=0;i<nleds;++i)
+    strip.setPixelColor(i, (i<lit)?r:0, (i<lit)?g:0, (i<lit)?b:0);
+
+  if (lastBriRef != BRIGHTNESS) {
+    strip.setBrightness(BRIGHTNESS);
+    lastBriRef = BRIGHTNESS;
+  }
+  strip.show();
+}
+
+// ---------- SMBus safety helpers ----------
+static bool waitBusIdle(uint8_t sda, uint8_t scl,
+                        uint32_t timeout_ms = RGBSMBUS_WAIT_IDLE_MS,
+                        int stable_needed = RGBSMBUS_IDLE_STABLE) {
+  uint32_t start = millis();
+  int stable = 0;
+  while ((millis() - start) < timeout_ms) {
+    bool sdaHigh = digitalRead(sda) == HIGH;
+    bool sclHigh = digitalRead(scl) == HIGH;
+    if (sdaHigh && sclHigh) {
+      if (++stable >= stable_needed) return true;
+    } else {
+      stable = 0;
+    }
+    delayMicroseconds(140);
+  }
+  return false;
+}
+
+static void smbusBreather() {
+  delayMicroseconds(150);
+  yield();
+}
+
+// Gentle recovery if the bus *never* looks idle across several polls
+static uint8_t s_stuckPolls = 0;
+static void maybeRecoverWire() {
+  if (++s_stuckPolls >= RGBSMBUS_STUCK_POLL_THRESHOLD) {
+    Wire.begin(PINS.sda, PINS.scl);
+    Wire.setClock(RGBSMBUS_I2C_HZ);
+#if defined(ARDUINO_ARCH_ESP32)
+    Wire.setTimeOut(20);
+#endif
+    s_stuckPolls = 0;
+  }
+}
+
+// ---------- STOP-only single byte read (1.6-safe) ----------
+static bool readByteSTOP(uint8_t addr7, uint8_t reg, uint8_t& value) {
+  RGBCtrlUDP::enterSmbusQuietUs(RGBSMBUS_GUARD_PER_ATTEMPT_US);
+  if (!waitBusIdle(PINS.sda, PINS.scl)) return false;
+
+  Wire.beginTransmission(addr7);
+  Wire.write(reg);
+  if (Wire.endTransmission(true) != 0) return false;  // STOP
+  smbusBreather();
+
+  int n = Wire.requestFrom((int)addr7, 1, (int)true); // STOP
+  if (n == 1 && Wire.available()) {
+    value = Wire.read();
+    smbusBreather();
+    return true;
+  }
+  return false;
+}
+
+// ---------- RS+read (only if allowed & not 1.6) ----------
+static bool readByteRS(uint8_t addr7, uint8_t reg, uint8_t& value) {
+  if (gIsXcalibur || !RGBSMBUS_ALLOW_RS) return false; // disabled for 1.6 or globally
+  RGBCtrlUDP::enterSmbusQuietUs(RGBSMBUS_GUARD_PER_ATTEMPT_US);
+  if (!waitBusIdle(PINS.sda, PINS.scl)) return false;
+
+  Wire.beginTransmission(addr7);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false; // repeated-start (no STOP)
+  int n = Wire.requestFrom((int)addr7, 1, (int)true); // end with STOP
+  if (n == 1 && Wire.available()) {
+    value = Wire.read();
+    return true;
+  }
+  return false;
+}
+
+// Try STOP first, optional RS second (single attempt)
+static bool readOncePrefStop(uint8_t addr7, uint8_t reg, uint8_t& value) {
+  if (readByteSTOP(addr7, reg, value)) return true;
+  if (readByteRS(addr7, reg, value))   return true;
+  return false;
+}
+
+// Light sampling: Xcalibur=1 sample, others=3 samples (median), one attempt each
+static bool readMedianByte(uint8_t addr7, uint8_t reg, uint8_t& out) {
+  if (gIsXcalibur) {
+    uint8_t v;
+    if (!readOncePrefStop(addr7, reg, v)) return false;
+    out = v;
+    return true;
+  }
+
+  // Non-1.6: up to 3 single-attempt samples
+  uint8_t got = 0, a=0, b=0, c=0;
+  for (uint8_t i=0; i<3; ++i) {
+    uint8_t v=0;
+    if (readOncePrefStop(addr7, reg, v)) {
+      if (got==0) a=v; else if (got==1) b=v; else c=v;
+      ++got;
+      delayMicroseconds(RGBSMBUS_INTER_SAMPLE_US);
+    }
+  }
+  if (got == 0) return false;
+  if (got == 1) { out = a; return true; }
+  if (got == 2) { out = uint8_t((a + b)/2); return true; }
+  // got == 3 → median of (a,b,c)
+  uint8_t lo = a<b ? a : b;  uint8_t hi = a>b ? a : b;
+  out = (c<lo) ? lo : (c>hi ? hi : c);
+  return true;
+}
+
+static bool readCpuCelsius(uint8_t& outC) {
+  uint8_t v=0;
+  if (!readMedianByte(SMC_ADDRESS, REG_CPUTEMP, v)) return false;
+  if (v > 100) return false;     // plausibility guard (0..100 °C)
+  outC = v;
+  return true;
+}
+static bool readFanPercent(uint8_t& outPct) {
+  uint8_t v=0;
+  if (!readMedianByte(SMC_ADDRESS, REG_FANSPEED, v)) return false;
+  uint16_t pct = (v <= 50) ? (uint16_t)v * 2u : (uint16_t)v; // 0..50 → % (some FW already 0..100)
+  if (pct > 100) pct = 100;
+  outPct = (uint8_t)pct;
+  return true;
+}
+
+// Probe for encoder (optional)
+static bool probeI2C(uint8_t addr7) {
+  // STOP-only presence probe
+  uint8_t dummy;
+  return readByteSTOP(addr7, 0x00, dummy);
+}
+
+// Lazy/guarded board probe: only when Type-D NOT present, and only once.
+static void detectBoardLazy() {
+  if (gBoardDetected) return;
+  if (typeDPresent()) return;               // strict: no SMBus while Type-D is around
+  RGBCtrlUDP::enterSmbusQuietUs(2000);      // keep consistent with other SMBus ops
+  // Require bus idle before probing; otherwise skip for this poll
+  if (!waitBusIdle(PINS.sda, PINS.scl)) return;
+  gIsXcalibur = probeI2C(I2C_XCALIBUR);     // single, quick probe
+  gBoardDetected = true;
+}
+
+// ---------- internal ----------
+static void applyEnableFlags(bool wantCPU, bool wantFAN) {
+  if (gEnableCPU != wantCPU) {
+    gEnableCPU = wantCPU;
+    if (!gEnableCPU && CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+  }
+  if (gEnableFAN != wantFAN) {
+    gEnableFAN = wantFAN;
+    if (!gEnableFAN && CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+  }
+}
+
+// ---------- public ----------
+void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
+  PINS = pins;
+  CH5_COUNT = ch5Count>10?10:ch5Count;
+  CH6_COUNT = ch6Count>10?10:ch6Count;
+
+  cpuStrip.updateLength(CH5_COUNT); cpuStrip.setPin(PINS.ch5);
+  fanStrip.updateLength(CH6_COUNT); fanStrip.setPin(PINS.ch6);
+
+  cpuStrip.begin(); cpuStrip.clear(); cpuStrip.setBrightness(BRIGHTNESS); cpuStrip.show();
+  fanStrip.begin(); fanStrip.clear(); fanStrip.setBrightness(BRIGHTNESS); fanStrip.show();
+
+  lastAppliedBrightnessCpu = BRIGHTNESS;
+  lastAppliedBrightnessFan = BRIGHTNESS;
+
+  // IMPORTANT: no internal pull-ups; Xbox SMBus has its own
+  pinMode(PINS.sda, INPUT);
+  pinMode(PINS.scl, INPUT);
+
+  Wire.begin(PINS.sda, PINS.scl);
+  Wire.setClock(RGBSMBUS_I2C_HZ);
+#if defined(ARDUINO_ARCH_ESP32)
+  Wire.setTimeOut(20); // keep stalls short to avoid UI hiccups
+#endif
+
+  // Do not probe SMBus here; we’ll detect lazily only when safe.
+  lastPoll = 0;
+  smoothedCpu = 0.f; smoothedFan = 0.f;
+
+  // Initialize local flags from RGBCtrl's saved state
+  applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
+
+  // Start Type-D beacon listener
+  guardUdp.begin(TYPE_D_PORT);
+}
+
+static void updateOnce() {
+  // Mirror UI flags on every cycle (cheap & keeps in sync)
+  applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
+
+  // Guard: if Type-D is present, avoid bus clash — blank bars and skip SMBus
+  if (typeDPresent()) {
+    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    return;
+  }
+
+  // If both disabled, skip the bus entirely and ensure LEDs are off
+  if (!gEnableCPU && !gEnableFAN) {
+    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    return;
+  }
+
+  // We’re about to talk SMBus (at least one metric enabled, no Type-D):
+  // probe once, safely, and wrap the whole poll in a coarse quiet window.
+  detectBoardLazy();
+  RGBCtrlUDP::enterSmbusQuietUs(RGBSMBUS_GUARD_PER_POLL_US);
+
+  // Require idle bus before this poll; if not, skip and maybe gently recover.
+  if (!waitBusIdle(PINS.sda, PINS.scl)) {
+    maybeRecoverWire();
+    // Blank bars to indicate temporary skip (no error flash)
+    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    return;
+  }
+  // Reset stuck counter on a good idle observation
+  s_stuckPolls = 0;
+
+  bool ok = true;
+  int cpuC = -1;
+  int fanP = -1;
+
+  if (gEnableCPU) {
+    uint8_t v=0;
+    if (readCpuCelsius(v)) cpuC = (int)v; else ok = false;
+  }
+  if (gEnableFAN) {
+    uint8_t v=0;
+    if (readFanPercent(v)) fanP = (int)v; else ok = false;
+  }
+
+  if (ok) {
+    if (gEnableCPU) {
+      if (cpuC >= 0) {
+        smoothedCpu = SMOOTH_ALPHA * float(cpuC) + (1.f-SMOOTH_ALPHA)*smoothedCpu;
+        drawBar(cpuStrip, lastAppliedBrightnessCpu,
+                CH5_COUNT,
+                barLen(smoothedCpu, CPU_MAX_C, CH5_COUNT),
+                colorForCpu(smoothedCpu));
+      } else {
+        drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+      }
+    } else {
+      drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    }
+
+    if (gEnableFAN) {
+      if (fanP >= 0) {
+        smoothedFan = SMOOTH_ALPHA * float(fanP) + (1.f-SMOOTH_ALPHA)*smoothedFan;
+        drawBar(fanStrip, lastAppliedBrightnessFan,
+                CH6_COUNT,
+                barLen(smoothedFan, FAN_FAST_MAX, CH6_COUNT),
+                colorForFan(smoothedFan));
+      } else {
+        drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+      }
+    } else {
+      drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    }
+  } else {
+    // Error indicator on first pixel of enabled bars
+    if (gEnableCPU && CH5_COUNT) {
+      cpuStrip.setPixelColor(0,(FAIL_COLOR>>16)&0xFF,(FAIL_COLOR>>8)&0xFF,FAIL_COLOR&0xFF);
+      if (lastAppliedBrightnessCpu != BRIGHTNESS) { cpuStrip.setBrightness(BRIGHTNESS); lastAppliedBrightnessCpu = BRIGHTNESS; }
+      cpuStrip.show();
+    }
+    if (gEnableFAN && CH6_COUNT) {
+      fanStrip.setPixelColor(0,(FAIL_COLOR>>16)&0xFF,(FAIL_COLOR>>8)&0xFF,FAIL_COLOR&0xFF);
+      if (lastAppliedBrightnessFan != BRIGHTNESS) { fanStrip.setBrightness(BRIGHTNESS); lastAppliedBrightnessFan = BRIGHTNESS; }
+      fanStrip.show();
+    }
+  }
+}
+
+void loop() {
+  // Always keep guard presence fresh
+  pollTypeD();
+
+  uint32_t now = millis();
+  if (now - lastPoll >= POLL_INTERVAL_MS) {
+    lastPoll = now;
+    updateOnce();
+  }
+}
+
+// Manual refresh hook
+void refreshNow() { updateOnce(); }
+
+// These remain as direct controls if you want to toggle outside RGBCtrl
+void setCpuEnabled(bool en) { applyEnableFlags(en, gEnableFAN); }
+void setFanEnabled(bool en) { applyEnableFlags(gEnableCPU, en); }
+bool cpuEnabled() { return gEnableCPU; }
+bool fanEnabled() { return gEnableFAN; }
+
+bool isXcalibur() { return gIsXcalibur; }
+
+// Optional: tiny REST API. Now includes guard info so the Web UI
+// can show that SMBus is temporarily disabled by Type-D presence.
+void attachWeb(AsyncWebServer& server, const char* basePath) {
+  String base = (basePath && *basePath) ? basePath : "/config/smbus";
+  String api  = base + "/api/flags";
+
+  server.on(api.c_str(), HTTP_GET, [](AsyncWebServerRequest* r){
+    bool cpuSaved = RGBCtrl::smbusCpuEnabled();
+    bool fanSaved = RGBCtrl::smbusFanEnabled();
+    bool guarded  = typeDPresent();
+
+    // Effective flags reflect guard
+    bool cpuEff = guarded ? false : cpuSaved;
+    bool fanEff = guarded ? false : fanSaved;
+
+    auto* s = r->beginResponseStream("application/json");
+    s->printf("{\"cpu\":%s,\"fan\":%s,\"savedCpu\":%s,\"savedFan\":%s,"
+              "\"guarded\":%s,\"guardReason\":\"%s\",\"xcalibur\":%s}",
+              cpuEff?"true":"false",
+              fanEff?"true":"false",
+              cpuSaved?"true":"false",
+              fanSaved?"true":"false",
+              guarded?"true":"false",
+              guarded?"TypeD":"none",
+              gIsXcalibur?"true":"false");
+    r->send(s);
+  });
+
+  server.on(api.c_str(), HTTP_POST, [](AsyncWebServerRequest* r){
+    r->send(405, "text/plain", "POST with body only");
+  },
+  nullptr,
+  [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t){
+    // Keep compatibility: allows toggling local flags, but guard still applies.
+    bool ok = true;
+    String body((const char*)data, len);
+    body.replace(" ", ""); body.replace("\n", ""); body.replace("\r", "");
+    int icpu = body.indexOf("\"cpu\":");
+    int ifan = body.indexOf("\"fan\":");
+    bool cpu=gEnableCPU, fan=gEnableFAN;
+    if (icpu >= 0) {
+      int v = body.indexOf("true", icpu);  int f = body.indexOf("false", icpu);
+      if      (v>=0 && (f<0 || v<f)) cpu = true;
+      else if (f>=0 && (v<0 || f<v)) cpu = false;
+      else ok = false;
+    }
+    if (ifan >= 0) {
+      int v = body.indexOf("true", ifan);  int f = body.indexOf("false", ifan);
+      if      (v>=0 && (f<0 || f<v)) fan = true;
+      else if (f>=0 && (v<0 || f<v)) fan = false;
+      else ok = false;
+    }
+    applyEnableFlags(cpu, fan);
+
+    bool guarded  = typeDPresent();
+    bool cpuEff = guarded ? false : gEnableCPU;
+    bool fanEff = guarded ? false : gEnableFAN;
+
+    auto* s = req->beginResponseStream("application/json");
+    s->printf("{\"ok\":%s,\"cpu\":%s,\"fan\":%s,\"guarded\":%s,\"guardReason\":\"%s\",\"xcalibur\":%s}",
+              ok?"true":"false",
+              cpuEff?"true":"false",
+              fanEff?"true":"false",
+              guarded?"true":"false",
+              guarded?"TypeD":"none",
+              gIsXcalibur?"true":"false");
+    req->send(s);
+  });
+}
+
+} // namespace RGBsmbus

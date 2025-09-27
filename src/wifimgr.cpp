@@ -65,6 +65,191 @@ static void setAPConfig() {
   );
 }
 
+// ===== OTA HTML (progress + client-driven reboot) =====
+static const char OTA_PAGE[] PROGMEM = R"html(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>OTA Update</title>
+<style>
+  :root{--bg:#111;--card:#222;--ink:#EEE;--mut:#AAB;--btn:#2563eb;--ok:#2ea043;--err:#d32}
+  *{box-sizing:border-box} html,body{height:100%}
+  body{background:var(--bg);color:var(--ink);font-family:system-ui,Segoe UI,Roboto,Arial;margin:0}
+  .wrap{min-height:100%;display:flex;align-items:center;justify-content:center;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom)}
+  .box{width:100%;max-width:520px;margin:16px auto;background:var(--card);padding:18px 16px;border-radius:12px;box-shadow:0 8px 20px #0008}
+  h2{margin:0 0 12px}
+  .row{display:grid;grid-template-columns:1fr;gap:10px}
+  input[type=file],button{width:100%;margin:.25rem 0;padding:.7rem .8rem;border-radius:9px;border:1px solid #555;background:#111;color:var(--ink);font-size:1rem}
+  button{background:var(--btn);border:0;color:#fff;cursor:pointer}
+  .status{margin-top:10px;color:var(--mut)}
+  .bar{height:12px;background:#0c1222;border:1px solid #334;border-radius:999px;overflow:hidden}
+  .fill{height:100%;width:0%}
+  .ok{background:linear-gradient(90deg,#28a745,#3ddc84)}
+  .up{background:linear-gradient(90deg,#4c7cff,#7aa4ff)}
+  .err{background:linear-gradient(90deg,#d32,#f55)}
+  .msg{margin-top:8px;font-size:.95rem}
+</style></head>
+<body>
+<div class="wrap">
+  <div class="box">
+    <h2>OTA Update</h2>
+    <div class="row">
+      <input id="fw" type="file" accept=".bin,.bin.gz">
+      <button id="go">Upload & Flash</button>
+      <div class="bar"><div id="fill" class="fill up"></div></div>
+      <div id="msg" class="msg">Select a firmware <code>.bin</code> (or <code>.bin.gz</code>) and click “Upload & Flash”.</div>
+      <div class="row">
+        <button onclick="location.href='/'">⟵ Back to WiFi Setup</button>
+        <button onclick="location.href='/config'">Open Config</button>
+        <button onclick="reboot()" style="background:#a22">Reboot</button>
+      </div>
+      <div id="status" class="status"></div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  const fw   = document.getElementById('fw');
+  const btn  = document.getElementById('go');
+  const fill = document.getElementById('fill');
+  const msg  = document.getElementById('msg');
+  const status = document.getElementById('status');
+
+  function setFill(p, cls){
+    fill.style.width = (Math.max(0,Math.min(100,p))|0) + '%';
+    fill.className = 'fill ' + (cls||'up');
+  }
+  function reboot(){
+    fetch('/reboot',{method:'POST'}).catch(()=>0);
+    setTimeout(()=>location.reload(), 2500);
+  }
+  function pingUntilUp(path, cb){
+    let tries = 0;
+    const t = setInterval(()=>{
+      fetch(path, {cache:'no-store'}).then(r=>{ if (r.ok) { clearInterval(t); cb(true); } })
+      .catch(()=>{});
+      if (++tries > 180) { clearInterval(t); cb(false); }
+    }, 1000);
+  }
+
+  btn.onclick = function(){
+    const f = fw.files && fw.files[0];
+    if(!f){ msg.textContent = 'Please select a firmware file first.'; return; }
+
+    msg.textContent = 'Uploading...';
+    status.textContent = '';
+    setFill(0, 'up');
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/ota', true);
+    xhr.responseType = 'text';
+
+    xhr.upload.onprogress = function(ev){
+      if (ev.lengthComputable) {
+        const pc = ev.total ? (ev.loaded * 100 / ev.total) : 0;
+        setFill(pc, 'up');
+      }
+    };
+
+    xhr.onerror = function(){
+      setFill(100, 'err');
+      msg.textContent = 'Upload failed (network error).';
+    };
+
+    xhr.onload = function(){
+      let ok = xhr.status>=200 && xhr.status<300;
+      try { const j = JSON.parse(xhr.responseText||'{}'); ok = ok && !!j.ok; } catch(e){}
+      if (ok) {
+        setFill(100, 'ok');
+        msg.textContent = 'Flashed OK. Rebooting device...';
+        status.textContent = 'Waiting for device to come back online...';
+        fetch('/reboot',{method:'POST'}).catch(()=>0);
+        pingUntilUp('/ping', function(up){
+          status.textContent = up ? 'Device is back online. You may open Config.' :
+                                    'Device did not respond in time. Power-cycle if needed.';
+        });
+      } else {
+        setFill(100, 'err');
+        msg.textContent = 'Flash failed.';
+        status.textContent = xhr.responseText || ('HTTP '+xhr.status);
+      }
+    };
+
+    const form = new FormData();
+    form.append('firmware', f, f.name);
+    xhr.send(form);
+  };
+
+  window.reboot = reboot;
+})();
+</script>
+</body></html>
+)html";
+
+// ===== OTA route registration =====
+static void registerOTARoutes() {
+  // Optional firmware info
+  server.on("/fw", HTTP_GET, [](AsyncWebServerRequest* req){
+    String v = String("TypeD/") + String(__DATE__) + " " + String(__TIME__);
+    req->send(200, "text/plain", v);
+  });
+
+  // OTA page
+  server.on("/ota", HTTP_GET, [](AsyncWebServerRequest* req){
+    req->send_P(200, "text/html", OTA_PAGE);
+  });
+
+  // OTA upload/flash (streamed), JSON reply; client triggers /reboot
+  server.on(
+    "/ota",
+    HTTP_POST,
+    [](AsyncWebServerRequest* request){
+      const bool ok = !Update.hasError();
+      if (ok) {
+        String msg = "{\"ok\":true,\"bytes\":" + String(Update.progress()) + "}";
+        request->send(200, "application/json", msg);
+        Serial.println("[OTA] Update uploaded OK; client will reboot device.");
+      } else {
+        request->send(500, "application/json", "{\"ok\":false}");
+        Serial.println("[OTA] Update failed.");
+      }
+    },
+    [](AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final){
+      if (index == 0) {
+        Serial.printf("[OTA] Starting: %s\n", filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.printError(Serial);
+        }
+      }
+      if (len) {
+        if (Update.write(data, len) != len) {
+          Update.printError(Serial);
+        }
+      }
+      if (final) {
+        if (!Update.end(true)) {
+          Update.printError(Serial);
+        } else {
+          Serial.printf("[OTA] Finished: %u bytes\n", (unsigned)(index + len));
+        }
+      }
+    }
+  );
+
+  // Reboot endpoint (client calls this after success)
+  server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest* req){
+    req->send(200, "text/plain", "Rebooting...");
+    Serial.println("[OTA] Reboot requested");
+    auto t = millis() + 300; while (millis() < t) { delay(1); }
+    ESP.restart();
+  });
+  server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest* req){
+    req->send(200, "text/plain", "Rebooting...");
+    Serial.println("[OTA] Reboot requested (GET)");
+    auto t = millis() + 300; while (millis() < t) { delay(1); }
+    ESP.restart();
+  });
+}
+
 static void addPortalRoutesOnce() {
   if (portalRoutesAdded) return;
   portalRoutesAdded = true;
@@ -75,6 +260,9 @@ static void addPortalRoutesOnce() {
     resp->addHeader("Cache-Control", "no-store");
     request->send(resp);
   });
+
+  // ⬇️ Add OTA routes (available in AP/STA)
+  registerOTARoutes();
 
   // ---------- Portal UI ----------
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -181,179 +369,6 @@ static void addPortalRoutesOnce() {
     resp->addHeader("Cache-Control", "no-store");
     request->send(resp);
   });
-
-  // ---------- OTA PAGE (progress + robust layout) ----------
-  server.on("/ota", HTTP_GET, [](AsyncWebServerRequest *request){
-    static const char kPage[] PROGMEM = R"HTML(
-<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>OTA Update</title>
-<style>
-  :root{--bg:#111;--card:#222;--ink:#EEE;--mut:#AAB;--btn:#2563eb;--ok:#2ea043;--err:#d32}
-  *{box-sizing:border-box}
-  html,body{height:100%}
-  body{background:var(--bg);color:var(--ink);font-family:system-ui,Segoe UI,Roboto,Arial;margin:0}
-  .wrap{min-height:100%;display:flex;align-items:center;justify-content:center;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom)}
-  .box{width:100%;max-width:520px;margin:16px auto;background:var(--card);padding:18px 16px;border-radius:12px;box-shadow:0 8px 20px #0008}
-  h2{margin:0 0 12px}
-  .row{display:grid;grid-template-columns:1fr;gap:10px}
-  input[type=file],button{width:100%;margin:.25rem 0;padding:.7rem .8rem;border-radius:9px;border:1px solid #555;background:#111;color:var(--ink);font-size:1rem}
-  button{background:var(--btn);border:0;color:#fff;cursor:pointer}
-  .links{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-  .links a, .links button{flex:1}
-  .status{margin-top:10px;color:var(--mut)}
-  .bar{height:12px;background:#0c1222;border:1px solid #334; border-radius:999px; overflow:hidden}
-  .fill{height:100%;width:0%}
-  .ok{background:linear-gradient(90deg,#28a745,#3ddc84)}
-  .up{background:linear-gradient(90deg,#4c7cff,#7aa4ff)}
-  .err{background:linear-gradient(90deg,#d32,#f55)}
-  .msg{margin-top:8px;font-size:.95rem}
-</style></head>
-<body>
-<div class="wrap">
-  <div class="box">
-    <h2>OTA Update</h2>
-    <div class="row">
-      <input id="fw" type="file" accept=".bin,.bin.gz">
-      <button id="go">Upload & Flash</button>
-      <div class="bar"><div id="fill" class="fill up"></div></div>
-      <div id="msg" class="msg">Select a firmware <code>.bin</code> (or <code>.bin.gz</code>) and click “Upload & Flash”.</div>
-      <div class="links">
-        <button onclick="location.href='/'">⟵ Back to WiFi Setup</button>
-        <button onclick="location.href='/config'">Open Config</button>
-      </div>
-      <div id="status" class="status"></div>
-    </div>
-  </div>
-</div>
-<script>
-(function(){
-  const fw   = document.getElementById('fw');
-  const btn  = document.getElementById('go');
-  const fill = document.getElementById('fill');
-  const msg  = document.getElementById('msg');
-  const status = document.getElementById('status');
-
-  function setFill(p, cls){
-    fill.style.width = (Math.max(0,Math.min(100,p))|0) + '%';
-    fill.className = 'fill ' + (cls||'up');
-  }
-
-  function pingUntilUp(path, cb){
-    let tries = 0;
-    const t = setInterval(()=>{
-      fetch(path, {cache:'no-store'}).then(r=>{
-        if (r.ok) { clearInterval(t); cb(true); }
-      }).catch(()=>{ /* ignore until it comes back */ });
-      if (++tries > 180) { clearInterval(t); cb(false); } // ~3 min
-    }, 1000);
-  }
-
-  btn.onclick = function(){
-    const f = fw.files && fw.files[0];
-    if(!f){ msg.textContent = 'Please select a firmware file first.'; return; }
-
-    msg.textContent = 'Uploading...';
-    status.textContent = '';
-    setFill(0, 'up');
-
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/update', true);
-    xhr.responseType = 'text';
-
-    xhr.upload.onprogress = function(ev){
-      if (ev.lengthComputable) {
-        const pc = ev.total ? (ev.loaded * 100 / ev.total) : 0;
-        setFill(pc, 'up');
-      }
-    };
-
-    xhr.onerror = function(){
-      setFill(100, 'err');
-      msg.textContent = 'Upload failed (network error).';
-    };
-
-    xhr.onload = function(){
-      const ok = (xhr.status >= 200 && xhr.status < 300);
-      if (ok && xhr.responseText && xhr.responseText.toLowerCase().indexOf('update complete') !== -1) {
-        setFill(100, 'ok');
-        msg.textContent = 'Flashed OK. Rebooting device...';
-        status.textContent = 'Waiting for device to come back online...';
-        // After firmware applies, device reboots. Poll /ping to detect it’s up again.
-        pingUntilUp('/ping', function(up){
-          if (up) {
-            status.textContent = 'Device is back online. You may open Config.';
-          } else {
-            status.textContent = 'Device did not respond in time. Power-cycle if needed.';
-          }
-        });
-      } else {
-        setFill(100, 'err');
-        msg.textContent = 'Flash failed.';
-        status.textContent = xhr.responseText || ('HTTP '+xhr.status);
-      }
-    };
-
-    const form = new FormData();
-    form.append('firmware', f, f.name);
-    xhr.send(form);
-  };
-})();
-</script>
-</body></html>
-)HTML";
-    AsyncWebServerResponse* resp = request->beginResponse(200, "text/html", kPage);
-    resp->addHeader("Cache-Control", "no-store");
-    request->send(resp);
-  });
-
-  // ---------- OTA FLASH (chunk-safe + clear status text) ----------
-  server.on(
-    "/update",
-    HTTP_POST,
-    [](AsyncWebServerRequest *request) {
-      // reply will be sent from upload handler on 'final'
-    },
-    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-      static bool hadError = false;
-
-      if (index == 0) {
-        hadError = false;
-        Serial.printf("[OTA] Start: %s (%u bytes expected)\n", filename.c_str(), (unsigned)request->contentLength());
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-          Update.printError(Serial);
-          hadError = true;
-        }
-      }
-
-      if (!hadError && len) {
-        size_t written = Update.write(data, len);
-        if (written != len) {
-          Serial.printf("[OTA] Write failed: wrote %u of %u\n", (unsigned)written, (unsigned)len);
-          Update.printError(Serial);
-          hadError = true;
-        }
-      }
-
-      if (final) {
-        bool ok = !hadError && Update.end(true); // set as boot partition
-        if (!ok) Update.printError(Serial);
-
-        const char* body = ok ? "Update complete. Rebooting..." : "Update failed. See serial log.";
-        AsyncWebServerResponse *res = request->beginResponse(ok ? 200 : 500, "text/plain", body);
-        res->addHeader("Cache-Control", "no-store");
-        res->addHeader("Connection", "close");
-        request->send(res);
-
-        Serial.printf("[OTA] %s (%s)\n", ok ? "Success" : "Failed", filename.c_str());
-        if (ok) {
-          // Give the TCP stack some time to flush before reboot
-          delay(800);
-          ESP.restart();
-        }
-      }
-    }
-  );
 
   // ---------- WiFi status ----------
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
