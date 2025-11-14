@@ -134,6 +134,8 @@ Open **`/ota`**, pick your compiled `.bin`, upload, wait for reboot.
 
 ## Building / Compiling
 
+#### Web Flasher: [![XBOX=RGB Web Flasher](https://img.shields.io/badge/Web%20Flasher-XBOX%E2%80%93RGB-green?logo=esp32&logoColor=white)](https://darkone83.github.io/xbox-rgb.github.io/)
+
 ### Prerequisites
 
 - **Arduino IDE 2.x** (or PlatformIO)
