@@ -8,6 +8,7 @@
   <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Front.png" width=400><img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Back.png" width=400>
 </div>
 
+<a href="https://discord.gg/k2BQhSJ"><img src="https://github.com/Darkone83/ModXo-Basic/blob/main/Images/discord.svg"></a>
 
 A custom RGB controller that drives up to **6 WS2812/NeoPixel channels** for original Xbox RGB lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
 
