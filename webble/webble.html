@@ -1,0 +1,1085 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>XBOX-RGB BLE Console</title>
+<style>
+:root{--bg:#0f1115;--card:#161a22;--a:#6aa9ff;--t:#d6e1ff;--muted:#94a3b8;}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--t);font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+.container{max-width:980px;margin:12px auto;padding:0 12px}
+.card{background:var(--card);border-radius:16px;padding:18px 16px;box-shadow:0 6px 24px #0008;margin-bottom:18px}
+.row{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+.h{font-size:22px;margin:0 0 12px}
+label{font-size:13px;color:var(--muted);display:block;margin-bottom:6px}
+input,select,button{width:100%;padding:12px;font-size:14px;min-height:44px;border-radius:10px;border:1px solid #2a3142;background:#0b0e14;color:#d6e1ff}
+input[type=color]{padding:0;height:40px;cursor:pointer}
+input[type=range]{cursor:pointer}
+button{background:#0f172a;border:1px solid #35425b;cursor:pointer;transition:all 0.2s}
+button:hover{background:#1e293b}
+button.primary{background:#2563eb;border:0}
+button.primary:hover{background:#1d4ed8}
+button.danger{background:#b91c1c;border:0}
+button.danger:hover{background:#991b1b}
+button[disabled]{opacity:.5;cursor:default}
+button[disabled]:hover{background:#0f172a}
+button.primary[disabled]:hover{background:#2563eb}
+button.danger[disabled]:hover{background:#b91c1c}
+.row>div{grid-column:span 12}
+@media(min-width:700px){
+  .md-6{grid-column:span 6}
+  .md-4{grid-column:span 4}
+  .md-3{grid-column:span 3}
+  .md-2{grid-column:span 2}
+}
+.badge{display:inline-block;background:#0b1220;border:1px solid #1e293b;padding:2px 8px;border-radius:999px;font-size:12px;margin-left:8px}
+.hint{color:#90a4c9;font-size:12px}
+.footer{color:var(--muted);font-size:12px;text-align:center;padding:8px 0 24px}
+.sep{margin:0 8px}
+fieldset{border:1px solid #273657;border-radius:12px;padding:12px;margin:12px 0}
+legend{padding:0 6px;font-size:13px;color:var(--muted);font-weight:500}
+.status-pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;background:#0b1220;border-radius:999px;padding:4px 10px;border:1px solid #1e293b}
+.status-dot{width:8px;height:8px;border-radius:999px;background:#4b5563}
+.status-dot.connected{background:#22c55e}
+.status-text{font-size:13px;color:var(--muted);margin-top:4px}
+.log{margin-top:8px;padding:8px;border-radius:10px;background:#020617;border:1px solid #111827;font-family:monospace;font-size:11px;max-height:220px;overflow-y:auto;white-space:pre-wrap}
+.toggle-row{display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0}
+.slider-row-label{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:2px}
+.color-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:8px}
+.color-item{text-align:center}
+.color-item label{font-size:11px;margin-bottom:4px}
+.playlist-step{background:#0b0e14;border:1px solid #1e293b;border-radius:10px;padding:12px;margin-bottom:10px}
+.playlist-step-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.playlist-step-header h4{margin:0;font-size:13px;color:var(--t)}
+.playlist-controls{display:flex;gap:8px;margin-top:12px}
+.small-btn{padding:4px 8px;font-size:11px;width:auto;min-width:60px}
+.step-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px}
+@media(min-width:700px){
+  .step-grid{grid-template-columns:repeat(4,1fr)}
+}
+.count-inputs{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.count-item label{font-size:11px}
+.count-item input{padding:6px 8px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="container">
+  <!-- Header / connect card -->
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <h1 class="h">XBOX-RGB <span class="badge">BLE Console</span></h1>
+    </div>
+    <div class="row" style="align-items:flex-end;">
+      <div class="md-6">
+        <label>Device / Status</label>
+        <div class="status-pill">
+          <div id="statusDot" class="status-dot"></div>
+          <span id="statusConnLabel">Disconnected</span>
+        </div>
+        <div id="statusText" class="status-text">Not connected</div>
+      </div>
+      <div class="md-6" style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button id="btnConnect" class="primary">Connect to XBOX-RGB</button>
+        <button id="btnGetCfg">Get Config</button>
+      </div>
+    </div>
+    <div class="hint" style="margin-top:8px;">
+      Requires Chrome / Edge with Web Bluetooth. Use only one controller (web / nRF) at a time.
+    </div>
+  </div>
+
+  <!-- Quick controls -->
+  <div class="card">
+    <h2 class="h" style="font-size:16px;margin-bottom:8px;">Quick Controls</h2>
+    <div class="row">
+      <div class="md-3">
+        <div class="toggle-row">
+          <input type="checkbox" id="chkMasterOff" style="width:auto;">
+          <label for="chkMasterOff" style="margin:0;">Master Off</label>
+        </div>
+      </div>
+      <div class="md-3">
+        <div class="toggle-row">
+          <input type="checkbox" id="chkKratosMode" style="width:auto;">
+          <label for="chkKratosMode" style="margin:0;">Kratos Mode</label>
+        </div>
+      </div>
+      <div class="md-6">
+        <div class="slider-row-label">
+          <label for="sliderBrightness">Brightness</label>
+          <span id="brightnessValue">180</span>
+        </div>
+        <input type="range" id="sliderBrightness" min="0" max="255" value="180">
+      </div>
+    </div>
+  </div>
+
+  <!-- LED Counts -->
+  <div class="card">
+    <h2 class="h" style="font-size:16px;margin-bottom:8px;">LED Counts per Channel</h2>
+    <div class="count-inputs">
+      <div class="count-item">
+        <label for="count1">CH1 (Front)</label>
+        <input type="number" id="count1" min="0" max="50" value="50">
+      </div>
+      <div class="count-item">
+        <label for="count2">CH2 (Left)</label>
+        <input type="number" id="count2" min="0" max="50" value="50">
+      </div>
+      <div class="count-item">
+        <label for="count3">CH3 (Rear)</label>
+        <input type="number" id="count3" min="0" max="50" value="50">
+      </div>
+      <div class="count-item">
+        <label for="count4">CH4 (Right)</label>
+        <input type="number" id="count4" min="0" max="50" value="50">
+      </div>
+    </div>
+  </div>
+
+  <!-- Mode / timing -->
+  <div class="card">
+    <h2 class="h" style="font-size:16px;margin-bottom:8px;">Mode & Animation</h2>
+    <div class="row">
+      <div class="md-6">
+        <label for="selectMode">Animation Mode</label>
+        <select id="selectMode">
+          <option value="0">0 – Solid</option>
+          <option value="1">1 – Breathe</option>
+          <option value="2">2 – Color Wipe</option>
+          <option value="3">3 – Larson Scanner</option>
+          <option value="4" selected>4 – Rainbow</option>
+          <option value="5">5 – Theater Chase</option>
+          <option value="6">6 – Twinkle</option>
+          <option value="7">7 – Comet</option>
+          <option value="8">8 – Meteor Shower</option>
+          <option value="9">9 – Clock Spin</option>
+          <option value="10">10 – Plasma</option>
+          <option value="11">11 – Fire</option>
+          <option value="12">12 – Palette Cycle</option>
+          <option value="13">13 – Palette Chase</option>
+          <option value="14">14 – Custom Playlist</option>
+          <option value="15">15 – UNSC vs Covenant</option>
+        </select>
+      </div>
+      <div class="md-6">
+        <div class="row">
+          <div class="md-4">
+            <div class="slider-row-label">
+              <label for="sliderSpeed">Speed</label>
+              <span id="speedValue">128</span>
+            </div>
+            <input type="range" id="sliderSpeed" min="0" max="255" value="128">
+          </div>
+          <div class="md-4">
+            <div class="slider-row-label">
+              <label for="sliderIntensity">Intensity</label>
+              <span id="intensityValue">128</span>
+            </div>
+            <input type="range" id="sliderIntensity" min="0" max="255" value="128">
+          </div>
+          <div class="md-4">
+            <div class="slider-row-label">
+              <label for="sliderWidth">Width</label>
+              <span id="widthValue">4</span>
+            </div>
+            <input type="range" id="sliderWidth" min="0" max="255" value="4">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Color Palette -->
+  <div class="card">
+    <h2 class="h" style="font-size:16px;margin-bottom:8px;">Color Palette</h2>
+    <div class="row">
+      <div class="md-3">
+        <label for="paletteCount">Active Colors</label>
+        <select id="paletteCount">
+          <option value="1">1 Color</option>
+          <option value="2" selected>2 Colors</option>
+          <option value="3">3 Colors</option>
+          <option value="4">4 Colors</option>
+        </select>
+      </div>
+    </div>
+    <div class="color-grid">
+      <div class="color-item">
+        <label for="colorA">Color A</label>
+        <input type="color" id="colorA" value="#ff0000">
+      </div>
+      <div class="color-item">
+        <label for="colorB">Color B</label>
+        <input type="color" id="colorB" value="#ffa000">
+      </div>
+      <div class="color-item">
+        <label for="colorC">Color C</label>
+        <input type="color" id="colorC" value="#00ff00">
+      </div>
+      <div class="color-item">
+        <label for="colorD">Color D</label>
+        <input type="color" id="colorD" value="#0000ff">
+      </div>
+    </div>
+  </div>
+
+  <!-- Channel Reverse -->
+  <div class="card">
+    <h2 class="h" style="font-size:16px;margin-bottom:8px;">Channel Direction</h2>
+    <div class="row">
+      <div class="md-3">
+        <div class="toggle-row">
+          <input type="checkbox" id="reverse0" style="width:auto;" checked>
+          <label for="reverse0" style="margin:0;">CH1 Reverse</label>
+        </div>
+      </div>
+      <div class="md-3">
+        <div class="toggle-row">
+          <input type="checkbox" id="reverse1" style="width:auto;">
+          <label for="reverse1" style="margin:0;">CH2 Reverse</label>
+        </div>
+      </div>
+      <div class="md-3">
+        <div class="toggle-row">
+          <input type="checkbox" id="reverse2" style="width:auto;">
+          <label for="reverse2" style="margin:0;">CH3 Reverse</label>
+        </div>
+      </div>
+      <div class="md-3">
+        <div class="toggle-row">
+          <input type="checkbox" id="reverse3" style="width:auto;" checked>
+          <label for="reverse3" style="margin:0;">CH4 Reverse</label>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SMBus Controls -->
+  <div class="card">
+    <h2 class="h" style="font-size:16px;margin-bottom:8px;">SMBus Features</h2>
+    <div class="row">
+      <div class="md-3">
+        <div class="toggle-row">
+          <input type="checkbox" id="enableCpu" style="width:auto;" checked>
+          <label for="enableCpu" style="margin:0;">CPU Temp LED</label>
+        </div>
+      </div>
+      <div class="md-3">
+        <div class="toggle-row">
+          <input type="checkbox" id="enableFan" style="width:auto;" checked>
+          <label for="enableFan" style="margin:0;">Fan Speed LED</label>
+        </div>
+      </div>
+      <div class="md-3">
+        <div class="toggle-row">
+          <input type="checkbox" id="resumeOnBoot" style="width:auto;" checked>
+          <label for="resumeOnBoot" style="margin:0;">Resume on Boot</label>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Custom Playlist Editor -->
+  <div class="card" id="playlistCard" style="display:none;">
+    <h2 class="h" style="font-size:16px;margin-bottom:8px;">Custom Playlist Editor</h2>
+    <div class="hint" style="margin-bottom:12px;">
+      Create a sequence of animation steps. Each step has its own mode, colors, and timing.
+    </div>
+    <div id="playlistSteps"></div>
+    <div class="playlist-controls">
+      <button id="btnAddStep" class="small-btn primary">+ Add Step</button>
+      <button id="btnClearSteps" class="small-btn danger">Clear All</button>
+      <div class="toggle-row" style="margin-left:auto;">
+        <input type="checkbox" id="customLoop" style="width:auto;" checked>
+        <label for="customLoop" style="margin:0;">Loop Playlist</label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Action Buttons -->
+  <div class="card">
+    <div class="row">
+      <div class="md-12" style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button id="btnPreview" class="primary">Preview</button>
+        <button id="btnSave">Save to Device</button>
+        <button id="btnReset" class="danger">Reset Defaults</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="card">
+    <h2 class="h" style="font-size:16px;margin-bottom:8px;">Device Log</h2>
+    <div id="log" class="log"></div>
+  </div>
+
+  <div class="footer">
+    XBOX-RGB BLE Client v1.8.0 &bull; © Darkone Customs 2025 / Team Resurgent
+  </div>
+</div>
+
+<script>
+// BLE UUIDs (lowercase, full 128-bit)
+const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write
+const TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify
+
+let device = null;
+let server = null;
+let service = null;
+let rxChar = null;
+let txChar = null;
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+// UI Elements
+const btnConnect   = document.getElementById("btnConnect");
+const btnGetCfg    = document.getElementById("btnGetCfg");
+const btnPreview   = document.getElementById("btnPreview");
+const btnSave      = document.getElementById("btnSave");
+const btnReset     = document.getElementById("btnReset");
+const btnAddStep   = document.getElementById("btnAddStep");
+const btnClearSteps = document.getElementById("btnClearSteps");
+const statusText   = document.getElementById("statusText");
+const statusDot    = document.getElementById("statusDot");
+const statusConnLabel = document.getElementById("statusConnLabel");
+const logEl        = document.getElementById("log");
+const playlistCard = document.getElementById("playlistCard");
+const playlistSteps = document.getElementById("playlistSteps");
+
+const sliderBrightness = document.getElementById("sliderBrightness");
+const brightnessValue  = document.getElementById("brightnessValue");
+const sliderSpeed      = document.getElementById("sliderSpeed");
+const speedValue       = document.getElementById("speedValue");
+const sliderIntensity  = document.getElementById("sliderIntensity");
+const intensityValue   = document.getElementById("intensityValue");
+const sliderWidth      = document.getElementById("sliderWidth");
+const widthValue       = document.getElementById("widthValue");
+const selectMode       = document.getElementById("selectMode");
+const paletteCount     = document.getElementById("paletteCount");
+const chkMasterOff     = document.getElementById("chkMasterOff");
+const chkKratosMode    = document.getElementById("chkKratosMode");
+const chkEnableCpu     = document.getElementById("enableCpu");
+const chkEnableFan     = document.getElementById("enableFan");
+const chkResumeOnBoot  = document.getElementById("resumeOnBoot");
+const chkCustomLoop    = document.getElementById("customLoop");
+
+const colorA = document.getElementById("colorA");
+const colorB = document.getElementById("colorB");
+const colorC = document.getElementById("colorC");
+const colorD = document.getElementById("colorD");
+
+const count1 = document.getElementById("count1");
+const count2 = document.getElementById("count2");
+const count3 = document.getElementById("count3");
+const count4 = document.getElementById("count4");
+
+const reverse0 = document.getElementById("reverse0");
+const reverse1 = document.getElementById("reverse1");
+const reverse2 = document.getElementById("reverse2");
+const reverse3 = document.getElementById("reverse3");
+
+let playlistData = [];
+
+function log(msg){
+  const t = new Date().toISOString().split("T")[1].split(".")[0];
+  logEl.textContent += "["+t+"] "+msg+"\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setConnectedUI(connected){
+  btnGetCfg.disabled   = !connected;
+  btnPreview.disabled  = !connected;
+  btnSave.disabled     = !connected;
+  btnReset.disabled    = !connected;
+  btnConnect.textContent = connected ? "Disconnect" : "Connect to XBOX-RGB";
+  statusText.textContent = connected ? "Connected to XBOX-RGB" : "Not connected";
+  statusConnLabel.textContent = connected ? "Connected" : "Disconnected";
+  statusDot.classList.toggle("connected", connected);
+}
+
+async function connect(){
+  try {
+    log("Requesting XBOX-RGB device...");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: "XBOX-RGB" }],
+      optionalServices: [SERVICE_UUID]
+    });
+
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    log("Connecting to GATT server...");
+    server = await device.gatt.connect();
+
+    log("Getting service...");
+    service = await server.getPrimaryService(SERVICE_UUID);
+
+    log("Getting characteristics...");
+    rxChar = await service.getCharacteristic(RX_UUID);
+    txChar = await service.getCharacteristic(TX_UUID);
+
+    await txChar.startNotifications();
+    txChar.addEventListener("characteristicvaluechanged", onNotify);
+
+    setConnectedUI(true);
+    log("Connected. Ready to control XBOX-RGB.");
+    
+    // Auto-fetch config on connect
+    setTimeout(() => sendJson({ op: "get" }), 500);
+  } catch (err) {
+    log("Error: " + err);
+  }
+}
+
+function disconnect(){
+  if (device && device.gatt.connected){
+    log("Disconnecting...");
+    device.gatt.disconnect();
+  }
+}
+
+function onDisconnected(){
+  log("Disconnected.");
+  setConnectedUI(false);
+}
+
+function onNotify(event){
+  const value = event.target.value;
+  const text  = dec.decode(value);
+  
+  // Initialize buffer and timer
+  if (!window.bleRxBuffer) window.bleRxBuffer = "";
+  if (window.bleRxTimer) clearTimeout(window.bleRxTimer);
+  
+  // Append chunk to buffer
+  window.bleRxBuffer += text;
+  
+  log("RX chunk: " + text.length + " bytes, buffer total: " + window.bleRxBuffer.length);
+  
+  // Try to parse as complete JSON immediately
+  let parsed = false;
+  try {
+    const obj = JSON.parse(window.bleRxBuffer);
+    // Valid JSON received!
+    parsed = true;
+    processCompleteJson(obj, window.bleRxBuffer);
+    window.bleRxBuffer = ""; // Clear buffer
+    if (window.bleRxTimer) clearTimeout(window.bleRxTimer);
+  } catch(e) {
+    // Not complete yet or invalid JSON
+  }
+  
+  // If not parsed yet, set a timer to try again after no more chunks arrive
+  if (!parsed) {
+    window.bleRxTimer = setTimeout(() => {
+      log("RX timeout - attempting to parse buffered data (" + window.bleRxBuffer.length + " bytes)");
+      
+      // Try to extract the first complete JSON object if buffer is corrupted/duplicated
+      let jsonToParse = window.bleRxBuffer;
+      let obj = null;
+      
+      // First, try to parse as-is
+      try {
+        obj = JSON.parse(jsonToParse);
+        log("SUCCESS: Parsed complete buffer");
+      } catch(e) {
+        log("Buffer parse failed: " + e.message);
+        log("Attempting to extract first valid JSON object...");
+        
+        // Try to find the first complete JSON object by counting braces
+        let depth = 0;
+        let start = -1;
+        for (let i = 0; i < jsonToParse.length; i++) {
+          if (jsonToParse[i] === '{') {
+            if (depth === 0) start = i;
+            depth++;
+          } else if (jsonToParse[i] === '}') {
+            depth--;
+            if (depth === 0 && start >= 0) {
+              // Found complete object
+              let extracted = jsonToParse.substring(start, i + 1);
+              try {
+                obj = JSON.parse(extracted);
+                log("SUCCESS: Extracted valid JSON (" + extracted.length + " bytes from offset " + start + ")");
+                break;
+              } catch(e2) {
+                log("Extracted JSON still invalid: " + e2.message);
+              }
+            }
+          }
+        }
+      }
+      
+      if (obj) {
+        processCompleteJson(obj, jsonToParse);
+      } else {
+        log("ERROR: Could not extract valid JSON from buffer");
+        log("First 200 chars: " + jsonToParse.substring(0, 200));
+      }
+      
+      window.bleRxBuffer = "";
+    }, 200); // 200ms timeout - if no more chunks arrive, try to parse
+  }
+}
+
+function processCompleteJson(obj, rawJson) {
+  log("========================================");
+  log("COMPLETE JSON RECEIVED:");
+  
+  // Only show first 500 chars to avoid log spam
+  if (rawJson.length > 500) {
+    log(rawJson.substring(0, 500) + "... (" + rawJson.length + " total bytes)");
+  } else {
+    log(rawJson);
+  }
+  log("========================================");
+  
+  // Handle the response
+  if (obj.op === "get" && obj.cfg){
+    log("***** GET RESPONSE DETECTED *****");
+    log("cfg object keys: " + Object.keys(obj.cfg).join(", "));
+    log("cfg.mode = " + obj.cfg.mode + " (type: " + typeof obj.cfg.mode + ")");
+    log("cfg.brightness = " + obj.cfg.brightness);
+    log("cfg.count = " + JSON.stringify(obj.cfg.count));
+    log("cfg.reverse = " + JSON.stringify(obj.cfg.reverse));
+    
+    // Call the update function
+    applyCfgToUI(obj.cfg);
+    
+    // Verify UI was updated
+    log("***** VERIFYING UI UPDATE *****");
+    log("Mode dropdown value: " + selectMode.value);
+    log("Brightness slider value: " + sliderBrightness.value);
+    log("Count inputs: [" + count1.value + ", " + count2.value + ", " + count3.value + ", " + count4.value + "]");
+    
+  } else if (obj.ok) {
+    log("Command acknowledged: OK (op: " + obj.op + ")");
+  } else {
+    log("Response: " + JSON.stringify(obj));
+  }
+}
+
+async function sendJson(obj){
+  if (!rxChar){
+    log("Not connected (no RX characteristic).");
+    return;
+  }
+  const text = JSON.stringify(obj);
+  log("TX: " + text);
+  const data = enc.encode(text);
+  
+  // BLE characteristic limit is 512 bytes
+  const MAX_CHUNK = 512;
+  
+  if (data.length <= MAX_CHUNK) {
+    // Send as single packet
+    try {
+      await rxChar.writeValue(data);
+    } catch(err) {
+      log("Write error: " + err);
+    }
+  } else {
+    // Send in chunks
+    log(`Splitting ${data.length} bytes into chunks...`);
+    let offset = 0;
+    let chunkNum = 0;
+    
+    while (offset < data.length) {
+      const chunkSize = Math.min(MAX_CHUNK, data.length - offset);
+      const chunk = data.slice(offset, offset + chunkSize);
+      
+      try {
+        await rxChar.writeValue(chunk);
+        chunkNum++;
+        log(`Sent chunk ${chunkNum}: ${chunkSize} bytes`);
+        offset += chunkSize;
+        
+        // Small delay between chunks to avoid overwhelming the receiver
+        if (offset < data.length) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      } catch(err) {
+        log(`Chunk ${chunkNum} error: ${err}`);
+        break;
+      }
+    }
+    
+    if (offset >= data.length) {
+      log(`Transfer complete: ${chunkNum} chunks sent`);
+    }
+  }
+}
+
+function hexToRgb24(hex) {
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  if (!result) return 0;
+  const r = parseInt(result[1], 16);
+  const g = parseInt(result[2], 16);
+  const b = parseInt(result[3], 16);
+  return (r << 16) | (g << 8) | b;
+}
+
+function rgb24ToHex(rgb24) {
+  const r = (rgb24 >> 16) & 0xFF;
+  const g = (rgb24 >> 8) & 0xFF;
+  const b = rgb24 & 0xFF;
+  return "#" + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1);
+}
+
+function applyCfgToUI(cfg){
+  log("Applying config to UI...");
+  log("Config object: " + JSON.stringify(cfg));
+  
+  // Brightness
+  if (typeof cfg.brightness === "number"){
+    sliderBrightness.value = cfg.brightness;
+    brightnessValue.textContent = cfg.brightness;
+    log("  brightness: " + cfg.brightness);
+  }
+  
+  // Mode
+  if (typeof cfg.mode === "number"){
+    selectMode.value = String(cfg.mode);
+    updatePlaylistVisibility();
+    log("  mode: " + cfg.mode);
+  }
+  
+  // Animation parameters
+  if (typeof cfg.speed === "number"){
+    sliderSpeed.value = cfg.speed;
+    speedValue.textContent = cfg.speed;
+    log("  speed: " + cfg.speed);
+  }
+  if (typeof cfg.intensity === "number"){
+    sliderIntensity.value = cfg.intensity;
+    intensityValue.textContent = cfg.intensity;
+    log("  intensity: " + cfg.intensity);
+  }
+  if (typeof cfg.width === "number"){
+    sliderWidth.value = cfg.width;
+    widthValue.textContent = cfg.width;
+    log("  width: " + cfg.width);
+  }
+  
+  // Toggles
+  if (typeof cfg.masterOff === "boolean"){
+    chkMasterOff.checked = cfg.masterOff;
+    log("  masterOff: " + cfg.masterOff);
+  }
+  if (typeof cfg.kratosMode === "boolean"){
+    chkKratosMode.checked = cfg.kratosMode;
+    log("  kratosMode: " + cfg.kratosMode);
+  }
+  
+  // Palette
+  if (typeof cfg.paletteCount === "number"){
+    paletteCount.value = String(cfg.paletteCount);
+    log("  paletteCount: " + cfg.paletteCount);
+  }
+  if (typeof cfg.colorA === "number"){
+    colorA.value = rgb24ToHex(cfg.colorA);
+    log("  colorA: " + cfg.colorA + " -> " + colorA.value);
+  }
+  if (typeof cfg.colorB === "number"){
+    colorB.value = rgb24ToHex(cfg.colorB);
+    log("  colorB: " + cfg.colorB + " -> " + colorB.value);
+  }
+  if (typeof cfg.colorC === "number"){
+    colorC.value = rgb24ToHex(cfg.colorC);
+    log("  colorC: " + cfg.colorC + " -> " + colorC.value);
+  }
+  if (typeof cfg.colorD === "number"){
+    colorD.value = rgb24ToHex(cfg.colorD);
+    log("  colorD: " + cfg.colorD + " -> " + colorD.value);
+  }
+  
+  // LED Counts
+  if (cfg.count && Array.isArray(cfg.count) && cfg.count.length >= 4){
+    count1.value = cfg.count[0];
+    count2.value = cfg.count[1];
+    count3.value = cfg.count[2];
+    count4.value = cfg.count[3];
+    log("  counts: [" + cfg.count.join(", ") + "]");
+  } else {
+    log("  counts: MISSING or invalid - " + typeof cfg.count);
+  }
+  
+  // Reverse flags
+  if (cfg.reverse && Array.isArray(cfg.reverse) && cfg.reverse.length >= 4){
+    reverse0.checked = !!cfg.reverse[0];
+    reverse1.checked = !!cfg.reverse[1];
+    reverse2.checked = !!cfg.reverse[2];
+    reverse3.checked = !!cfg.reverse[3];
+    log("  reverse: [" + cfg.reverse.join(", ") + "]");
+  } else {
+    log("  reverse: MISSING or invalid - " + typeof cfg.reverse);
+  }
+  
+  // SMBus features
+  if (typeof cfg.enableCpu === "boolean"){
+    chkEnableCpu.checked = cfg.enableCpu;
+    log("  enableCpu: " + cfg.enableCpu);
+  }
+  if (typeof cfg.enableFan === "boolean"){
+    chkEnableFan.checked = cfg.enableFan;
+    log("  enableFan: " + cfg.enableFan);
+  }
+  if (typeof cfg.resumeOnBoot === "boolean"){
+    chkResumeOnBoot.checked = cfg.resumeOnBoot;
+    log("  resumeOnBoot: " + cfg.resumeOnBoot);
+  }
+  
+  // Custom playlist
+  if (typeof cfg.customLoop === "boolean"){
+    chkCustomLoop.checked = cfg.customLoop;
+    log("  customLoop: " + cfg.customLoop);
+  }
+  if (typeof cfg.customSeq === "string" && cfg.customSeq.length > 0){
+    try {
+      const parsed = JSON.parse(cfg.customSeq);
+      if (Array.isArray(parsed)) {
+        playlistData = parsed;
+        renderPlaylist();
+        log("  customSeq: Loaded " + playlistData.length + " playlist steps");
+      }
+    } catch(e) {
+      log("  customSeq: Error parsing - " + e);
+      playlistData = [];
+    }
+  } else {
+    log("  customSeq: " + (cfg.customSeq ? cfg.customSeq.length + " chars" : "MISSING"));
+  }
+  
+  log("Config applied successfully");
+}
+
+function buildConfigFromUI(){
+  const cfg = {
+    mode: parseInt(selectMode.value, 10),
+    brightness: parseInt(sliderBrightness.value, 10),
+    speed: parseInt(sliderSpeed.value, 10),
+    intensity: parseInt(sliderIntensity.value, 10),
+    width: parseInt(sliderWidth.value, 10),
+    masterOff: chkMasterOff.checked,
+    kratosMode: chkKratosMode.checked,
+    paletteCount: parseInt(paletteCount.value, 10),
+    colorA: hexToRgb24(colorA.value),
+    colorB: hexToRgb24(colorB.value),
+    colorC: hexToRgb24(colorC.value),
+    colorD: hexToRgb24(colorD.value),
+    count: [
+      parseInt(count1.value, 10),
+      parseInt(count2.value, 10),
+      parseInt(count3.value, 10),
+      parseInt(count4.value, 10)
+    ],
+    reverse: [
+      reverse0.checked,
+      reverse1.checked,
+      reverse2.checked,
+      reverse3.checked
+    ],
+    enableCpu: chkEnableCpu.checked,
+    enableFan: chkEnableFan.checked,
+    resumeOnBoot: chkResumeOnBoot.checked,
+    customLoop: chkCustomLoop.checked
+  };
+  
+  // Only include customSeq if mode is Custom Playlist (14) to save space
+  const mode = parseInt(selectMode.value, 10);
+  if (mode === 14) {
+    cfg.customSeq = JSON.stringify(playlistData);
+  } else {
+    cfg.customSeq = "[]"; // Empty array string for other modes
+  }
+  
+  return cfg;
+}
+
+function updatePlaylistVisibility(){
+  // Show playlist editor only when Custom Playlist mode is selected (mode 14)
+  const mode = parseInt(selectMode.value, 10);
+  playlistCard.style.display = (mode === 14) ? 'block' : 'none';
+}
+
+function renderPlaylist(){
+  playlistSteps.innerHTML = '';
+  if (playlistData.length === 0){
+    playlistData = [{
+      mode: 0,
+      duration: 1000,
+      speed: 128,
+      intensity: 128,
+      width: 4,
+      paletteCount: 2,
+      colorA: 0xFF0000,
+      colorB: 0xFFA000,
+      colorC: 0x00FF00,
+      colorD: 0x0000FF
+    }];
+  }
+  
+  playlistData.forEach((step, idx) => {
+    const stepDiv = document.createElement('div');
+    stepDiv.className = 'playlist-step';
+    stepDiv.innerHTML = `
+      <div class="playlist-step-header">
+        <h4>Step ${idx + 1}</h4>
+        <button class="small-btn danger" onclick="deleteStep(${idx})">Delete</button>
+      </div>
+      <div class="step-grid">
+        <div>
+          <label style="font-size:11px;">Mode</label>
+          <select class="step-mode" data-idx="${idx}" style="padding:6px 8px;font-size:12px;">
+            <option value="0">Solid</option>
+            <option value="1">Breathe</option>
+            <option value="2">Color Wipe</option>
+            <option value="3">Larson</option>
+            <option value="4">Rainbow</option>
+            <option value="5">Theater</option>
+            <option value="6">Twinkle</option>
+            <option value="7">Comet</option>
+            <option value="8">Meteor</option>
+            <option value="9">Clock Spin</option>
+            <option value="10">Plasma</option>
+            <option value="11">Fire</option>
+            <option value="12">Palette Cycle</option>
+            <option value="13">Palette Chase</option>
+          </select>
+        </div>
+        <div>
+          <label style="font-size:11px;">Duration (ms)</label>
+          <input type="number" class="step-duration" data-idx="${idx}" value="${step.duration || 1000}" style="padding:6px 8px;font-size:12px;">
+        </div>
+        <div>
+          <label style="font-size:11px;">Speed</label>
+          <input type="number" class="step-speed" data-idx="${idx}" value="${step.speed || 128}" min="0" max="255" style="padding:6px 8px;font-size:12px;">
+        </div>
+        <div>
+          <label style="font-size:11px;">Intensity</label>
+          <input type="number" class="step-intensity" data-idx="${idx}" value="${step.intensity || 128}" min="0" max="255" style="padding:6px 8px;font-size:12px;">
+        </div>
+        <div>
+          <label style="font-size:11px;">Width</label>
+          <input type="number" class="step-width" data-idx="${idx}" value="${step.width || 4}" min="0" max="255" style="padding:6px 8px;font-size:12px;">
+        </div>
+        <div>
+          <label style="font-size:11px;">Palette Count</label>
+          <input type="number" class="step-palette" data-idx="${idx}" value="${step.paletteCount || 2}" min="1" max="4" style="padding:6px 8px;font-size:12px;">
+        </div>
+        <div>
+          <label style="font-size:11px;">Color A</label>
+          <input type="color" class="step-colorA" data-idx="${idx}" value="${rgb24ToHex(step.colorA || 0xFF0000)}" style="height:30px;">
+        </div>
+        <div>
+          <label style="font-size:11px;">Color B</label>
+          <input type="color" class="step-colorB" data-idx="${idx}" value="${rgb24ToHex(step.colorB || 0xFFA000)}" style="height:30px;">
+        </div>
+        <div>
+          <label style="font-size:11px;">Color C</label>
+          <input type="color" class="step-colorC" data-idx="${idx}" value="${rgb24ToHex(step.colorC || 0x00FF00)}" style="height:30px;">
+        </div>
+        <div>
+          <label style="font-size:11px;">Color D</label>
+          <input type="color" class="step-colorD" data-idx="${idx}" value="${rgb24ToHex(step.colorD || 0x0000FF)}" style="height:30px;">
+        </div>
+      </div>
+    `;
+    playlistSteps.appendChild(stepDiv);
+    
+    // Set the mode value
+    stepDiv.querySelector('.step-mode').value = String(step.mode || 0);
+  });
+  
+  // Add event listeners to update playlistData
+  document.querySelectorAll('.step-mode, .step-duration, .step-speed, .step-intensity, .step-width, .step-palette').forEach(el => {
+    el.addEventListener('change', updatePlaylistFromUI);
+  });
+  document.querySelectorAll('.step-colorA, .step-colorB, .step-colorC, .step-colorD').forEach(el => {
+    el.addEventListener('change', updatePlaylistFromUI);
+  });
+}
+
+function updatePlaylistFromUI(){
+  document.querySelectorAll('.playlist-step').forEach((stepDiv, idx) => {
+    if (idx < playlistData.length){
+      playlistData[idx].mode = parseInt(stepDiv.querySelector('.step-mode').value, 10);
+      playlistData[idx].duration = parseInt(stepDiv.querySelector('.step-duration').value, 10);
+      playlistData[idx].speed = parseInt(stepDiv.querySelector('.step-speed').value, 10);
+      playlistData[idx].intensity = parseInt(stepDiv.querySelector('.step-intensity').value, 10);
+      playlistData[idx].width = parseInt(stepDiv.querySelector('.step-width').value, 10);
+      playlistData[idx].paletteCount = parseInt(stepDiv.querySelector('.step-palette').value, 10);
+      playlistData[idx].colorA = hexToRgb24(stepDiv.querySelector('.step-colorA').value);
+      playlistData[idx].colorB = hexToRgb24(stepDiv.querySelector('.step-colorB').value);
+      playlistData[idx].colorC = hexToRgb24(stepDiv.querySelector('.step-colorC').value);
+      playlistData[idx].colorD = hexToRgb24(stepDiv.querySelector('.step-colorD').value);
+    }
+  });
+}
+
+function deleteStep(idx){
+  if (playlistData.length > 1){
+    playlistData.splice(idx, 1);
+    renderPlaylist();
+  } else {
+    log("Cannot delete last step. Use Clear All instead.");
+  }
+}
+
+// UI wiring
+btnConnect.addEventListener("click", () => {
+  if (!navigator.bluetooth){
+    alert("Web Bluetooth is not supported in this browser.");
+    return;
+  }
+  if (device && device.gatt.connected){
+    disconnect();
+  } else {
+    connect();
+  }
+});
+
+btnGetCfg.addEventListener("click", () => {
+  // Clear any stale buffer before new request
+  window.bleRxBuffer = "";
+  if (window.bleRxTimer) clearTimeout(window.bleRxTimer);
+  log("Cleared RX buffer, sending get request...");
+  sendJson({ op: "get" });
+});
+
+btnReset.addEventListener("click", () => {
+  if (confirm("Reset XBOX-RGB to defaults?")){
+    sendJson({ op: "reset" });
+  }
+});
+
+btnPreview.addEventListener("click", () => {
+  // Clear buffer before sending
+  window.bleRxBuffer = "";
+  if (window.bleRxTimer) clearTimeout(window.bleRxTimer);
+  
+  const cfg = buildConfigFromUI();
+  sendJson({ op: "preview", cfg });
+});
+
+btnSave.addEventListener("click", () => {
+  // Clear buffer before sending
+  window.bleRxBuffer = "";
+  if (window.bleRxTimer) clearTimeout(window.bleRxTimer);
+  
+  const cfg = buildConfigFromUI();
+  sendJson({ op: "save", cfg });
+});
+
+btnAddStep.addEventListener("click", () => {
+  const newStep = {
+    mode: parseInt(selectMode.value, 10),
+    duration: 1000,
+    speed: parseInt(sliderSpeed.value, 10),
+    intensity: parseInt(sliderIntensity.value, 10),
+    width: parseInt(sliderWidth.value, 10),
+    paletteCount: parseInt(paletteCount.value, 10),
+    colorA: hexToRgb24(colorA.value),
+    colorB: hexToRgb24(colorB.value),
+    colorC: hexToRgb24(colorC.value),
+    colorD: hexToRgb24(colorD.value)
+  };
+  playlistData.push(newStep);
+  renderPlaylist();
+});
+
+btnClearSteps.addEventListener("click", () => {
+  if (confirm("Clear all playlist steps?")){
+    playlistData = [];
+    renderPlaylist();
+  }
+});
+
+selectMode.addEventListener("change", updatePlaylistVisibility);
+
+sliderBrightness.addEventListener("input", () => {
+  brightnessValue.textContent = sliderBrightness.value;
+});
+sliderSpeed.addEventListener("input", () => {
+  speedValue.textContent = sliderSpeed.value;
+});
+sliderIntensity.addEventListener("input", () => {
+  intensityValue.textContent = sliderIntensity.value;
+});
+sliderWidth.addEventListener("input", () => {
+  widthValue.textContent = sliderWidth.value;
+});
+
+// Initialize
+updatePlaylistVisibility();
+renderPlaylist();
+
+// Test function - call from console: testConfigUpdate()
+window.testConfigUpdate = function() {
+  const testCfg = {
+    brightness: 200,
+    mode: 4,
+    speed: 150,
+    intensity: 100,
+    width: 8,
+    masterOff: false,
+    kratosMode: false,
+    paletteCount: 3,
+    colorA: 0xFF0000,
+    colorB: 0x00FF00,
+    colorC: 0x0000FF,
+    colorD: 0xFFFF00,
+    count: [25, 35, 45, 50],
+    reverse: [false, true, false, true],
+    enableCpu: false,
+    enableFan: true,
+    resumeOnBoot: false,
+    customLoop: true,
+    customSeq: "[]"
+  };
+  log("=== RUNNING TEST CONFIG UPDATE ===");
+  applyCfgToUI(testCfg);
+};
+
+// DOM element verification
+window.verifyElements = function() {
+  log("=== DOM ELEMENT VERIFICATION ===");
+  const elements = {
+    'selectMode': selectMode,
+    'sliderBrightness': sliderBrightness,
+    'count1': count1,
+    'count2': count2,
+    'count3': count3,
+    'count4': count4,
+    'reverse0': reverse0,
+    'reverse1': reverse1,
+    'reverse2': reverse2,
+    'reverse3': reverse3
+  };
+  
+  for (const [name, el] of Object.entries(elements)) {
+    if (el) {
+      log(`  ${name}: EXISTS (value="${el.value || el.checked}")`);
+    } else {
+      log(`  ${name}: MISSING!`);
+    }
+  }
+  log("=================================");
+};
+
+// Show current RX buffer
+window.showBuffer = function() {
+  log("=== CURRENT RX BUFFER ===");
+  log("Length: " + (window.bleRxBuffer ? window.bleRxBuffer.length : 0) + " bytes");
+  log("Contents: " + (window.bleRxBuffer || "(empty)"));
+  log("=========================");
+};
+
+log("WebBLE UI ready. Connect to XBOX-RGB to begin.");
+log("Debug commands: testConfigUpdate(), verifyElements(), showBuffer()");
+</script>
+</body>
+</html>

@@ -1,9 +1,36 @@
+
+// ===============================================================
+// Compile-time toggle: ignore Type-D guard for testing
+// Define RGBSMBUS_IGNORE_TYPED to completely disable Type-D presence checks
+// Example: add -DRGBSMBUS_IGNORE_TYPED in your build flags, or uncomment below
+// ===============================================================
+#define RGBSMBUS_IGNORE_TYPED   // <--- uncomment for local testing
+#ifdef RGBSMBUS_IGNORE_TYPED
+  #warning "RGBSMBUS: Type-D guard is DISABLED (testing mode)"
+#endif
+
 #include "RGBsmbus.h"
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
 #include <ESPAsyncWebServer.h>
 #include <WiFiUdp.h>
+#include <Preferences.h>
+
+// ---- Global brightness (cached from NVS/Preferences) ----
+static Preferences s_prefs;
+static uint8_t  s_briCached = 160;                 // default if not set
+static uint32_t s_briNextReadMs = 0;
+static const uint32_t BRIGHTNESS_POLL_MS = 1000;   // refresh every 1s
+
+static uint8_t readGlobalBrightness() {
+  uint32_t now = millis();
+  if (now >= s_briNextReadMs) {
+    s_briCached = s_prefs.getUChar("brightness", s_briCached); // 0..255
+    s_briNextReadMs = now + BRIGHTNESS_POLL_MS;
+  }
+  return s_briCached;
+}
 
 // === UDP quiet-window hook (no heavy JSON parsing while we touch SMBus) ===
 namespace RGBCtrlUDP { void enterSmbusQuietUs(uint32_t dur_us); }
@@ -55,8 +82,6 @@ extern "C" __attribute__((weak)) uint32_t smbus_last_activity_ms() {
 #define RGBSMBUS_PIXEL_TYPE (NEO_GRB + NEO_KHZ800)
 #endif
 
-static const uint8_t  BRIGHTNESS        = 160;    // CH5/CH6 bar brightness
-
 // Cadence: very light on the bus. One RR step ~4s (+ jitter).
 #ifndef RGBSMBUS_POLL_MS
 #define RGBSMBUS_POLL_MS     4000
@@ -65,12 +90,15 @@ static const uint8_t  BRIGHTNESS        = 160;    // CH5/CH6 bar brightness
 #define RGBSMBUS_JITTER_MAX_MS  250
 #endif
 
+
+
 static const float    SMOOTH_ALPHA      = 0.35f;  // EMA smoothing
 
-// CPU °C thresholds
-static const float CPU_COOL_MAX_C = 25.0f;
-static const float CPU_WARM_MAX_C = 45.0f;
-static const float CPU_MAX_C      = 65.0f;
+// CPU °C thresholds (colors) + bar ceiling
+static const float CPU_COOL_MAX_C = 45.0f;
+static const float CPU_WARM_MAX_C = 65.0f;
+static const float CPU_MAX_C      = 85.0f;  // color clamp
+static const float CPU_BAR_MAX_C  = 85.0f;  // VU-style fill ceiling
 
 // Fan % thresholds
 static const float FAN_SLOW_MAX   = 33.0f;
@@ -164,6 +192,7 @@ static uint8_t lastAppliedBrightnessFan = 0xFF;
 // Round-robin step: 0=CPU, 1=FAN, 2=idle, 3=idle → repeat
 static uint8_t rr_step = 0;
 
+
 // -------- Type-D Expansion guard (UDP presence beacon) --------
 static WiFiUDP guardUdp;
 static const uint16_t TYPE_D_PORT = 50502;            // beacons arrive here
@@ -189,12 +218,14 @@ static void markTypeDSeen() {
 }
 
 static void pollTypeD() {
+#if defined(RGBSMBUS_IGNORE_TYPED)
+  return; // ignore UDP beacon checks entirely
+#endif
   int len = guardUdp.parsePacket();
   while (len > 0) {
     char msg[64];
     int r = guardUdp.read((uint8_t*)msg, (len < 63 ? len : 63));
     msg[r > 0 ? r : 0] = '\0';
-    // Expected broadcast payload: "TYPE_D_ID:6"
     if (strstr(msg, "TYPE_D_ID:6")) {
       markTypeDSeen();
     }
@@ -208,7 +239,11 @@ static inline bool typeDPresentWindow() {
 
 // HARD guard predicate: sticky OR presently within TTL window
 static inline bool smbusGuardedHard() {
+#if defined(RGBSMBUS_IGNORE_TYPED)
+  return false; // always unguarded for testing
+#else
   return gGuardSticky || typeDPresentWindow();
+#endif
 }
 
 // ---------- helpers ----------
@@ -260,15 +295,23 @@ static void drawBar(Adafruit_NeoPixel& strip,
                     uint8_t nleds,
                     uint8_t lit,
                     uint32_t rgb24) {
-  const uint8_t r=(rgb24>>16)&0xFF, g=(rgb24>>8)&0xFF, b=rgb24&0xFF;
+  if (nleds == 0) return;
 
+  // Explicit clear: used once when a channel is disabled
+  if (lit == 0 && rgb24 == 0) {
+    for (uint8_t i=0;i<nleds;++i) strip.setPixelColor(i, 0,0,0);
+    uint8_t want = readGlobalBrightness();
+    if (lastBriRef != want) { strip.setBrightness(want); lastBriRef = want; }
+    strip.show();
+    return;
+  }
+
+  const uint8_t r=(rgb24>>16)&0xFF, g=(rgb24>>8)&0xFF, b=rgb24&0xFF;
   for (uint8_t i=0;i<nleds;++i)
     strip.setPixelColor(i, (i<lit)?r:0, (i<lit)?g:0, (i<lit)?b:0);
 
-  if (lastBriRef != BRIGHTNESS) {
-    strip.setBrightness(BRIGHTNESS);
-    lastBriRef = BRIGHTNESS;
-  }
+  uint8_t want = readGlobalBrightness();
+  if (lastBriRef != want) { strip.setBrightness(want); lastBriRef = want; }
   strip.show();
 }
 
@@ -478,11 +521,11 @@ static void detectBoardLazy() {
 static void applyEnableFlags(bool wantCPU, bool wantFAN) {
   if (gEnableCPU != wantCPU) {
     gEnableCPU = wantCPU;
-    if (!gEnableCPU && CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (!gEnableCPU && CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0); // one-time clear
   }
   if (gEnableFAN != wantFAN) {
     gEnableFAN = wantFAN;
-    if (!gEnableFAN && CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    if (!gEnableFAN && CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0); // one-time clear
   }
 }
 
@@ -492,14 +535,18 @@ void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
   CH5_COUNT = ch5Count>10?10:ch5Count;
   CH6_COUNT = ch6Count>10?10:ch6Count;
 
+  // Open prefs (RO) and seed brightness
+  s_prefs.begin("rgbctrl", true);
+  s_briCached = s_prefs.getUChar("brightness", s_briCached);
+
   cpuStrip.updateLength(CH5_COUNT); cpuStrip.setPin(PINS.ch5);
   fanStrip.updateLength(CH6_COUNT); fanStrip.setPin(PINS.ch6);
 
-  cpuStrip.begin(); cpuStrip.clear(); cpuStrip.setBrightness(BRIGHTNESS); cpuStrip.show();
-  fanStrip.begin(); fanStrip.clear(); fanStrip.setBrightness(BRIGHTNESS); fanStrip.show();
+  cpuStrip.begin(); cpuStrip.clear(); cpuStrip.setBrightness(readGlobalBrightness()); cpuStrip.show();
+  fanStrip.begin(); fanStrip.clear(); fanStrip.setBrightness(readGlobalBrightness()); fanStrip.show();
 
-  lastAppliedBrightnessCpu = BRIGHTNESS;
-  lastAppliedBrightnessFan = BRIGHTNESS;
+  lastAppliedBrightnessCpu = readGlobalBrightness();
+  lastAppliedBrightnessFan = readGlobalBrightness();
 
   // Start with pins floated; Wire will init only when unguarded
   wirePinsToInput();
@@ -519,18 +566,16 @@ static void updateOnceRR() {
   // Mirror UI flags each cycle
   applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
 
-  // HARD guard path: blank bars, keep Wire down
+  // HARD guard path: blank enabled bars, keep Wire down
   if (smbusGuardedHard()) {
     dropWireIfGuarded();
-    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
-    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    if (gEnableCPU && CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (gEnableFAN && CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
   }
 
-  // If both disabled, ensure LEDs are off and skip the bus entirely
+  // If both disabled, skip the bus entirely (edge clear already done)
   if (!gEnableCPU && !gEnableFAN) {
-    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
-    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
   }
 
@@ -542,16 +587,16 @@ static void updateOnceRR() {
 
   ensureWireReady();
   if (!gWireReady) {
-    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
-    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    if (gEnableCPU && CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (gEnableFAN && CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
   }
 
   // Require idle lines AND spacing since last SMBus activity
   if (!waitBusIdle(PINS.sda, PINS.scl) || !quietSinceLastPollerTouch()) {
     maybeRecoverWire();
-    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
-    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    if (gEnableCPU && CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (gEnableFAN && CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
   }
   s_stuckPolls = 0;
@@ -573,33 +618,35 @@ static void updateOnceRR() {
   if (ok) {
     if (cpuC >= 0) {
       smoothedCpu = SMOOTH_ALPHA * float(cpuC) + (1.f-SMOOTH_ALPHA)*smoothedCpu;
-      drawBar(cpuStrip, lastAppliedBrightnessCpu,
-              CH5_COUNT,
-              barLen(smoothedCpu, CPU_MAX_C, CH5_COUNT),
-              colorForCpu(smoothedCpu));
-    } else if (!gEnableCPU) {
-      drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+      if (gEnableCPU && CH5_COUNT) {
+        drawBar(cpuStrip, lastAppliedBrightnessCpu,
+                CH5_COUNT,
+                barLen(smoothedCpu, CPU_BAR_MAX_C, CH5_COUNT),
+                colorForCpu(smoothedCpu));
+      }
     }
 
     if (fanP >= 0) {
       smoothedFan = SMOOTH_ALPHA * float(fanP) + (1.f-SMOOTH_ALPHA)*smoothedFan;
-      drawBar(fanStrip, lastAppliedBrightnessFan,
-              CH6_COUNT,
-              barLen(smoothedFan, FAN_FAST_MAX, CH6_COUNT),
-              colorForFan(smoothedFan));
-    } else if (!gEnableFAN) {
-      drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+      if (gEnableFAN && CH6_COUNT) {
+        drawBar(fanStrip, lastAppliedBrightnessFan,
+                CH6_COUNT,
+                barLen(smoothedFan, FAN_FAST_MAX, CH6_COUNT),
+                colorForFan(smoothedFan));
+      }
     }
   } else {
     // Error blink on first pixel of *enabled* bars
     if (gEnableCPU && CH5_COUNT) {
       cpuStrip.setPixelColor(0,(FAIL_COLOR>>16)&0xFF,(FAIL_COLOR>>8)&0xFF,FAIL_COLOR&0xFF);
-      if (lastAppliedBrightnessCpu != BRIGHTNESS) { cpuStrip.setBrightness(BRIGHTNESS); lastAppliedBrightnessCpu = BRIGHTNESS; }
+      uint8_t want = readGlobalBrightness();
+      if (lastAppliedBrightnessCpu != want) { cpuStrip.setBrightness(want); lastAppliedBrightnessCpu = want; }
       cpuStrip.show();
     }
     if (gEnableFAN && CH6_COUNT) {
       fanStrip.setPixelColor(0,(FAIL_COLOR>>16)&0xFF,(FAIL_COLOR>>8)&0xFF,FAIL_COLOR&0xFF);
-      if (lastAppliedBrightnessFan != BRIGHTNESS) { fanStrip.setBrightness(BRIGHTNESS); lastAppliedBrightnessFan = BRIGHTNESS; }
+      uint8_t want = readGlobalBrightness();
+      if (lastAppliedBrightnessFan != want) { fanStrip.setBrightness(want); lastAppliedBrightnessFan = want; }
       fanStrip.show();
     }
   }

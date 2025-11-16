@@ -8,17 +8,37 @@
 #include <esp_system.h>  // esp_random
 #include <vector>
 
-// Use the existing WiFiMgr server; no separate server objects needed.
+
 namespace WiFiMgr { AsyncWebServer& getServer(); }
 
+
+
 // -------------------- Build / Branding --------------------
-static const char* APP_VERSION = "1.6.1"; // shown in footer
+static const char* APP_VERSION = "1.7.2 Halo"; // shown in footer
 static const char* COPYRIGHT_TXT = "© Darkone Customs 2025";
 
 // -------------------- Limits / Types --------------------
 static const uint16_t MAX_PER_CH = 50;        // per requirement
 static const uint8_t  NUM_CH     = 4;         // CH1..CH4 only
 static const uint16_t MAX_RING   = MAX_PER_CH * NUM_CH; // 200
+
+static bool g_kratos_ready = false;
+
+// --- Kratos (passthrough) ---
+static const uint8_t KRATOS_GPIO = 11;     // upstream WS2812 data input
+static const uint16_t KRATOS_MAX_PIXELS = MAX_RING; // cap to ring size
+static const uint32_t KRATOS_STALE_MS = 750;        // blank if no recent frame
+static bool kratosInited = false;
+
+// Frame buffers (minimal for stub)
+static uint8_t  g_kr_buf[KRATOS_MAX_PIXELS * 3];      // RGB
+static uint16_t g_kr_count = 0;
+static uint32_t g_kr_lastMs = 0;
+static uint8_t  g_kr_blankSent = 0;
+
+// Back buffer for decode
+static uint8_t  g_kr_back[KRATOS_MAX_PIXELS * 3];
+static uint16_t g_kr_count_back = 0;
 
 namespace RGBCtrl {
 
@@ -81,6 +101,7 @@ struct AppConfig {
   // JSON string of steps; see Custom editor in WebUI for example.
   String   customSeq     = "[]";
   bool     customLoop    = true;
+  bool     kratosMode   = false; // Kratos passthrough
 } CFG;
 
 static bool inPreview = false;
@@ -105,6 +126,7 @@ enum : uint8_t {
 
   // --- NEW: user-defined playlist mode ---
   MODE_CUSTOM,
+  MODE_UNSC_COVENANT,   // new Halo-themed standoff
 
   MODE_COUNT
 };
@@ -208,6 +230,37 @@ static void showRing() {
   for (uint8_t s=0; s<NUM_CH; ++s) STRIPS[s]->show();
 }
 
+// Fan-out: copy a linear RGB buffer to the ring (CH1->CH4 in order)
+static void kratosPushToRing(const uint8_t* rgb, uint16_t count) {
+  uint16_t L = ringLen();
+  uint16_t n = (count < L) ? count : L;
+  for (uint16_t i=0;i<n;i++) {
+    RgbColor c(rgb[i*3+0], rgb[i*3+1], rgb[i*3+2]);
+    setRing(i, c);
+  }
+  for (uint16_t i=n;i<L;i++) setRing(i, RgbColor(0,0,0));
+  showRing();
+}
+
+static void rmtStart() {
+  g_kratos_ready = true;
+  Serial.println("Kratos mode enabled (stub - no RMT)");
+}
+
+static void rmtStop() {
+  g_kratos_ready = false;
+  Serial.println("Kratos mode disabled");
+}
+
+static void kratosPollRmt() {
+  // Stub - prevent stale timeout
+  static uint32_t lastUpdate = 0;
+  if (millis() - lastUpdate > 1000) {
+    g_kr_lastMs = millis();
+    lastUpdate = millis();
+  }
+}
+
 static RgbColor wheel(uint8_t pos) {
   if (pos < 85)   return RgbColor(255 - pos*3, pos*3, 0);
   if (pos < 170)  { pos -= 85;  return RgbColor(0, 255 - pos*3, pos*3); }
@@ -290,27 +343,77 @@ static void loadMotionPalette(uint8_t& n, RgbColor p[4]){
 // -------------------- Animations --------------------
 static void animSolid() { fillRing(rgbFrom24(CFG.colorA)); }
 
-// ---- UPDATED: smoother Breathe (ease + low-pass to remove stepping) ----
+// ---- Breathe: true fade-to-black + black-hold, strong speed response ----
 static void animBreathe() {
   uint16_t L = ringLen(); if (!L) return;
 
-  // Phase advances with speed; keep independent of tick granularity
-  static float phase = 0.f;
-  float step = 0.010f + (CFG.speed / 255.0f) * 0.045f; // ~slow → faster
-  phase += step;
+  // -------- Timebase (frame-rate independent) --------
+  static uint32_t lastMs = millis();
+  uint32_t now = millis();
+  float dt = (now - lastMs) / 1000.0f;   // seconds (>=0)
+  if (dt < 0.f) dt = 0.f;
 
-  // Base waveform 0..1 and eased (smoothstep) to avoid harsh edges
-  float s = 0.5f + 0.5f * sinf(phase * 6.2831853f);
-  float eased = s*s*(3.f - 2.f*s);
+  // -------- Black-hold handling --------
+  static bool     inHold = false;
+  static uint16_t holdLeftMs = 0;
 
-  // Keep a small floor so LEDs never fully black
-  float target = 0.10f + 0.90f * eased;
+  // Hold length scales with Intensity (0..255): 100–450 ms
+  uint16_t holdTargetMs = (uint16_t)(100.0f + (CFG.intensity / 255.0f) * 350.0f);
 
-  // Low-pass filter the level to smooth frame pacing artifacts
+  if (inHold) {
+    // stay fully black during hold
+    if (holdLeftMs > (uint16_t)((now - lastMs))) {
+      holdLeftMs -= (uint16_t)(now - lastMs);
+    } else {
+      inHold = false;
+      holdLeftMs = 0;
+    }
+    lastMs = now;
+    fillRing(RgbColor(0,0,0));
+    return;
+  }
+
+  lastMs = now;
+
+  // -------- Speed → Period (much stronger effect) --------
+  // Speed 0..255  =>  Period ~ 4.0s .. 0.35s (ease-in to make changes feel bigger)
+  float sp01 = CFG.speed / 255.0f;
+  float shaped = powf(sp01, 1.8f);             // nonlinear for stronger response
+  float period = 4.0f - 3.65f * shaped;        // seconds
+  if (period < 0.25f) period = 0.25f;
+
+  // -------- Phase integration with trough detection --------
+  static float phase = 0.0f;                   // 0..1
+  float inc = dt / period;
+
+  // If we are about to wrap (trough at phase==0), start a black-hold
+  if ((phase + inc) >= 1.0f) {
+    inHold = true;
+    holdLeftMs = holdTargetMs;
+    phase = 0.0f;                              // park at trough during hold
+    fillRing(RgbColor(0,0,0));
+    return;
+  }
+
+  phase += inc;                                // no wrap yet
+
+  // -------- Raised-cosine wave (smoothest), no floor --------
+  // y in [0,1], with y==0 at trough (phase==0)
+  float y = 0.5f - 0.5f * cosf(6.2831853f * phase);
+
+  // Gamma correct so low levels fade smoothly (avoid stepping shimmer)
+  const float GAMMA = 2.2f;
+  float level = powf(y, 1.0f / GAMMA);
+
+  // Critically-damped smoothing (alpha from dt) to kill micro-jitter
   static float lvl = 0.0f;
-  float alpha = 0.10f;                       // smoothing factor
-  lvl = lvl*(1.0f - alpha) + target*alpha;  // 0..1
+  float alpha = 1.0f - expf(-dt * 9.0f);       // ~9 Hz cutoff
+  // Snap near extremes to hit perfect black/white
+  if (level < 0.003f) level = 0.0f;
+  if (level > 0.997f) level = 1.0f;
+  lvl = lvl + (level - lvl) * alpha;
 
+  // Scale base color by level
   RgbColor base = rgbFrom24(CFG.colorA);
   RgbColor cur(
     (uint8_t)(base.R * lvl),
@@ -664,6 +767,255 @@ static void animPaletteChase() {
   }
 }
 
+static void animUNSCCovenant() {
+  uint16_t L = ringLen(); if (!L) return;
+
+  // ---------- Controls → Parameters ----------
+  // Width controls the "plasma beam" thickness
+  uint16_t block = (CFG.width < 2) ? 2 : CFG.width;
+
+  // Speed affects movement rate and energy pulse frequency
+  int denomMain = 5 - (CFG.speed / 64); if (denomMain < 1) denomMain = 1;
+  int denomEcho = denomMain - 1;        if (denomEcho < 1) denomEcho = 1;
+
+  // Intensity controls the violence of the energy clash
+  float edgeSoft = (CFG.intensity / 255.0f);
+  if (edgeSoft < 0.02f) edgeSoft = 0.02f;
+
+  // Plasma trail persistence
+  uint8_t trailFade = (uint8_t)(210 - (CFG.intensity > 200 ? 200 : CFG.intensity));
+  if (trailFade < 10) trailFade = 10;
+
+  // Energy clash intensity
+  float clashGain = 0.15f + 0.65f * (CFG.intensity / 255.0f);
+
+  // ---------- Timebase ----------
+  uint32_t t = tick;
+  uint16_t posCW   = (t / (uint16_t)denomMain) % L;
+  uint16_t posCCW  = (L - posCW) % L;
+  uint16_t posCW2  = (t / (uint16_t)denomEcho) % L;
+  uint16_t posCCW2 = (L - posCW2) % L;
+  
+  // Faction switching (like rounds in multiplayer)
+  bool flip = ((millis() / 8000U) & 1);
+
+  // ---------- Enhanced Halo-themed Palette ----------
+  RgbColor unscA, unscB, covA, covB;
+  if (CFG.paletteCount >= 4) {
+    unscA = rgbFrom32(CFG.colorA); unscB = rgbFrom32(CFG.colorB);
+    covA  = rgbFrom32(CFG.colorC); covB  = rgbFrom32(CFG.colorD);
+  } else {
+    // UNSC: Cool tactical blues with steel highlights
+    unscA = RgbColor(0x6B, 0x8E, 0xFF); // Bright tactical blue
+    unscB = RgbColor(0x40, 0x60, 0xD0); // Deep navy blue
+    // Covenant: Iconic purple-pink plasma
+    covA  = RgbColor(0xE6, 0x66, 0xFF); // Bright plasma purple
+    covB  = RgbColor(0x99, 0x33, 0xCC); // Deep covenant purple
+  }
+
+  // Energy field oscillation
+  float drift = fmodf((millis() * 0.00008f), 1.0f);
+  RgbColor unsc0 = lerp(unscA, unscB, 0.5f + 0.5f * sinf(drift * 6.2831853f));
+  RgbColor unsc1 = lerp(unscB, unscA, 0.5f + 0.5f * sinf(drift * 4.0f));
+  RgbColor cov0  = lerp(covA,  covB,  0.5f + 0.5f * sinf((1.0f - drift) * 6.2831853f));
+  RgbColor cov1  = lerp(covB,  covA,  0.5f + 0.5f * sinf((1.0f - drift) * 4.0f));
+
+  // ---------- Shield recharge effect ----------
+  float sp01 = CFG.speed / 255.0f;
+  float period = 3.0f - 2.5f * sp01; if (period < 0.5f) period = 0.5f;
+  float ph = fmodf((millis() / 1000.0f) / period, 1.0f);
+  
+  // Sharp shield pulses (like Mjolnir armor recharge)
+  float swell = 0.7f + 0.3f * powf(0.5f + 0.5f * sinf(6.2831853f * ph), 2.0f);
+
+  // ---------- Plasma trails ----------
+  fadeRing(trailFade);
+
+  // ---------- Helper functions ----------
+  auto clamp8 = [](int v)->uint8_t { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
+
+  // Plasma blend (additive with saturation)
+  auto plasmaBlend = [&](uint8_t base, uint8_t add)->uint8_t {
+    int result = base + add;
+    return clamp8(result > 255 ? 255 : result);
+  };
+
+  // Add plasma effect at ring position
+  auto addPlasmaAt = [&](uint16_t idx, const RgbColor& add){
+    uint16_t base = 0;
+    for (uint8_t s=0; s<NUM_CH; ++s) {
+      if (idx < base + segs[s].count) {
+        uint16_t within = idx - base;
+        bool rev = CFG.reverse[segs[s].ch] && segs[s].count;
+        uint16_t px = rev ? (segs[s].count - 1 - within) : within;
+        uint32_t packed = STRIPS[segs[s].ch]->getPixelColor(px);
+        RgbColor cur = unpackGRB(packed);
+        
+        // Additive blend for plasma glow
+        uint8_t r = plasmaBlend(cur.R, add.R);
+        uint8_t g = plasmaBlend(cur.G, add.G);
+        uint8_t b = plasmaBlend(cur.B, add.B);
+        STRIPS[segs[s].ch]->setPixelColor(px, r, g, b);
+        return;
+      }
+      base += segs[s].count;
+    }
+  };
+
+  // Plasma edge shaping with hot center
+  auto plasmaShape = [&](const RgbColor& c, float intensity)->RgbColor {
+    // Hot plasma center, cooler edges
+    float shaped = powf(fmaxf(0.f, intensity), 0.85f);
+    int sr = (int)(c.R * shaped);
+    int sg = (int)(c.G * shaped);
+    int sb = (int)(c.B * shaped);
+    return RgbColor(clamp8(sr), clamp8(sg), clamp8(sb));
+  };
+
+  // Energy weapon glow enhancement
+  auto energize = [&](const RgbColor& c, float satMul, float valMul)->RgbColor {
+    float h,s,v; rgb2hsv(c, h,s,v);
+    s = fminf(1.0f, s * satMul);
+    v = fminf(1.0f, v * valMul);
+    return hsv2rgb(h,s,v);
+  };
+
+  // Boost energy weapon colors
+  const float SAT_MUL = 1.25f;
+  const float VAL_MUL = 1.15f;
+  unsc0 = energize(unsc0, SAT_MUL, VAL_MUL);
+  unsc1 = energize(unsc1, SAT_MUL, VAL_MUL);
+  cov0  = energize(cov0,  SAT_MUL, VAL_MUL);
+  cov1  = energize(cov1,  SAT_MUL, VAL_MUL);
+
+  // Draw plasma beam (main layer)
+  auto drawPlasmaBeam = [&](uint16_t start, bool clockwise, const RgbColor& c0, const RgbColor& c1, float gain){
+    for (uint16_t w = 0; w < block; ++w) {
+      float tloc  = (block <= 1) ? 0.f : (w / (float)(block - 1));
+      RgbColor base = lerp(c0, c1, tloc);
+      
+      // Plasma beam profile (hot center, cooler edges)
+      float edgePos = fabsf((w - (block-1)/2.0f)) / (block/2.0f);
+      float soft = 1.0f - edgeSoft * powf(edgePos, 1.5f); // sharper falloff
+      if (soft < 0.f) soft = 0.f;
+
+      // Energy surge at beam center
+      float centerBoost = 1.0f + 0.15f * (1.0f - edgePos);
+      RgbColor plasma = energize(base, 1.1f, centerBoost);
+
+      // Add plasma flicker
+      float flicker = 1.0f + 0.1f * sinf(t * 0.3f + w * 0.5f);
+      float amp = soft * swell * gain * flicker;
+      RgbColor px = plasmaShape(plasma, amp);
+
+      uint16_t idx = clockwise ? (start + w) % L
+                               : ((start + L - w) % L);
+      setRing(idx, px);
+    }
+  };
+
+  // Draw plasma corona (additive layer)
+  auto drawPlasmaCorona = [&](uint16_t start, bool clockwise, const RgbColor& c0, const RgbColor& c1, float gain){
+    // Wider corona around main beam
+    uint16_t coronaWidth = block + 2;
+    for (uint16_t w = 0; w < coronaWidth; ++w) {
+      float tloc  = (coronaWidth <= 1) ? 0.f : (w / (float)(coronaWidth - 1));
+      RgbColor base = lerp(c0, c1, tloc);
+      
+      float edgePos = fabsf((w - (coronaWidth-1)/2.0f)) / (coronaWidth/2.0f);
+      float soft = 1.0f - powf(edgePos, 2.0f); // softer corona
+      if (soft < 0.f) soft = 0.f;
+
+      float amp = soft * swell * gain * 0.3f; // dimmer corona
+      RgbColor px = plasmaShape(base, amp);
+
+      uint16_t idx = clockwise ? (start + w) % L
+                               : ((start + L - w) % L);
+      addPlasmaAt(idx, px);
+    }
+  };
+
+  // ---------- Main alternating plasma streams ----------
+  uint16_t bands = L / block; if (bands < 2) bands = 2;
+  
+  // Draw coronas first (background glow)
+  for (uint16_t b = 0; b < bands; ++b) {
+    bool unscBand = ((b & 1) == 0) ^ flip;
+    uint16_t baseCW  = (posCW  + b * block) % L;
+    uint16_t baseCCW = (posCCW + b * block) % L;
+    if (unscBand)   drawPlasmaCorona(baseCW,  true,  unsc0, unsc1, 0.5f);
+    else            drawPlasmaCorona(baseCCW, false, cov0,  cov1,  0.5f);
+  }
+  
+  // Draw main beams
+  for (uint16_t b = 0; b < bands; ++b) {
+    bool unscBand = ((b & 1) == 0) ^ flip;
+    uint16_t baseCW  = (posCW  + b * block) % L;
+    uint16_t baseCCW = (posCCW + b * block) % L;
+    if (unscBand)   drawPlasmaBeam(baseCW,  true,  unsc0, unsc1, 1.0f);
+    else            drawPlasmaBeam(baseCCW, false, cov0,  cov1,  1.0f);
+  }
+
+  // ---------- Energy weapon projectiles (secondary motion) ----------
+  uint16_t projBlock = (block >= 3) ? (block - 2) : 1;
+  if (projBlock) {
+    float projGain = 0.6f;
+    uint16_t bands2 = L / projBlock; if (bands2 < 2) bands2 = 2;
+    for (uint16_t b = 0; b < bands2; ++b) {
+      bool unscBand = ((b & 1) == 0) ^ (!flip);
+      uint16_t baseCW2  = (posCW2  + b * projBlock + projBlock/2) % L;
+      uint16_t baseCCW2 = (posCCW2 + b * projBlock + projBlock/2) % L;
+      if (unscBand)   drawPlasmaCorona(baseCW2,  true,  unsc1, unsc0, projGain);
+      else            drawPlasmaCorona(baseCCW2, false, cov1,  cov0,  projGain);
+    }
+  }
+
+  // ---------- Shield impact flashes ----------
+  auto shieldImpact = [&](uint16_t center, const RgbColor& tint, uint8_t radius){
+    // Hexagonal shield flash pattern
+    RgbColor flash = energize(tint, 1.2f, 1.3f);
+    
+    // Sharp center hit
+    addPlasmaAt(center, RgbColor(
+      clamp8((int)(flash.R * clashGain * swell)),
+      clamp8((int)(flash.G * clashGain * swell)),
+      clamp8((int)(flash.B * clashGain * swell))
+    ));
+    
+    // Radial shockwave
+    for (int8_t d = 1; d <= (int8_t)radius; ++d) {
+      float falloff = 1.0f - (d / (float)(radius + 1));
+      falloff = powf(falloff, 1.5f); // sharp falloff like shield hit
+      
+      float amp = falloff * clashGain * swell * 0.8f;
+      RgbColor px = plasmaShape(flash, amp);
+      
+      addPlasmaAt((center + L + d) % L, px);
+      addPlasmaAt((center + L - d) % L, px);
+    }
+  };
+
+  // Calculate impact points with some chaos
+  uint16_t chaos = (uint16_t)(sinf(t * 0.01f) * L * 0.1f);
+  uint16_t meet1 = (posCW + posCCW/2 + chaos) % L;
+  uint16_t meet2 = (posCCW + posCW/2 + L/3 - chaos/2) % L;
+  
+  // UNSC shield flash (bright white-blue)
+  shieldImpact(meet1, RgbColor(200, 220, 255), (uint8_t)(block/2 + 2));
+  
+  // Covenant shield flash (purple-white)
+  shieldImpact(meet2, RgbColor(240, 200, 255), (uint8_t)(block/2 + 1));
+
+  // ---------- Random plasma sparks ----------
+  if ((esp_random() & 31) < 3) { // ~10% chance per frame
+    uint16_t sparkPos = esp_random() % L;
+    float sparkIntensity = 0.4f + 0.4f * ((esp_random() & 255) / 255.0f);
+    RgbColor sparkColor = ((esp_random() & 1) ? unsc0 : cov0);
+    RgbColor spark = plasmaShape(sparkColor, sparkIntensity * swell);
+    addPlasmaAt(sparkPos, spark);
+  }
+}
+
 // -------------------- NEW: Custom sequence (playlist) --------------------
 struct CustomStep {
   uint8_t  mode = MODE_SOLID;
@@ -679,33 +1031,6 @@ struct CustomStep {
   bool hasD=false;         uint32_t colorD=0;
 };
 
-static bool parseCustomSteps(const String& js, std::vector<CustomStep>& out) {
-  out.clear();
-  if (!js.length()) return true;
-  StaticJsonDocument<2048> doc;
-  auto err = deserializeJson(doc, js);
-  if (err || !doc.is<JsonArray>()) return false;
-  for (JsonVariant v : doc.as<JsonArray>()) {
-    if (!v.is<JsonObject>()) continue;
-    JsonObject o = v.as<JsonObject>();
-    CustomStep s;
-    s.mode = (uint8_t) (o.containsKey("mode") ? o["mode"].as<int>() : MODE_SOLID);
-    int dur = o.containsKey("duration") ? o["duration"].as<int>() : 1000;
-    if (dur < 1) dur = 1; if (dur > 60000) dur = 60000;
-    s.duration = (uint16_t)dur;
-    if (o.containsKey("speed"))       { s.hasSpeed=true;     s.speed=o["speed"].as<uint8_t>(); }
-    if (o.containsKey("intensity"))   { s.hasIntensity=true; s.intensity=o["intensity"].as<uint8_t>(); }
-    if (o.containsKey("width"))       { s.hasWidth=true;     int w=o["width"].as<int>(); if(w<1)w=1; if(w>255)w=255; s.width=(uint8_t)w; }
-    if (o.containsKey("paletteCount")){ s.hasPCnt=true;      uint8_t pc=o["paletteCount"].as<uint8_t>(); s.pcount=(pc<1)?1:((pc>4)?4:pc); }
-    if (o.containsKey("colorA"))      { s.hasA=true; s.colorA=o["colorA"].as<uint32_t>(); }
-    if (o.containsKey("colorB"))      { s.hasB=true; s.colorB=o["colorB"].as<uint32_t>(); }
-    if (o.containsKey("colorC"))      { s.hasC=true; s.colorC=o["colorC"].as<uint32_t>(); }
-    if (o.containsKey("colorD"))      { s.hasD=true; s.colorD=o["colorD"].as<uint32_t>(); }
-    out.push_back(s);
-  }
-  return true;
-}
-
 static void applyStepOverrides(const CustomStep& s) {
   if (s.hasSpeed)     CFG.speed = s.speed;
   if (s.hasIntensity) CFG.intensity = s.intensity;
@@ -717,18 +1042,55 @@ static void applyStepOverrides(const CustomStep& s) {
   if (s.hasD)         CFG.colorD = s.colorD;
 }
 
+// Adapter to keep older call-site name working
+static bool parseCustomStep(const String& js, std::vector<CustomStep>& out) {
+  return parseCustomStep(js, out);
+}
+
 static void animCustom() {
   static std::vector<CustomStep> seq;
   static String lastJs;
-  static uint32_t stepStart=0;
-  static size_t idx=0;
+  static uint32_t stepStart = 0;
+  static size_t idx = 0;
+  static bool firstRun = true;
+  
+  // Debug: Log on first run or mode change
+  if (firstRun) {
+    Serial.println("\n=== animCustom: First run ===");
+    Serial.print("customSeq length: ");
+    Serial.println(CFG.customSeq.length());
+    Serial.print("customSeq content: ");
+    Serial.println(CFG.customSeq);
+    Serial.print("customLoop: ");
+    Serial.println(CFG.customLoop ? "true" : "false");
+    firstRun = false;
+  }
 
   // (Re)parse if changed
   if (lastJs != CFG.customSeq) {
+    Serial.println("\n=== animCustom: Parsing new sequence ===");
     seq.clear();
-    parseCustomSteps(CFG.customSeq, seq);
+    
+    bool parseOk = parseCustomStep(CFG.customSeq, seq);
+    Serial.print("Parse result: ");
+    Serial.println(parseOk ? "SUCCESS" : "FAILED");
+    Serial.print("Number of steps parsed: ");
+    Serial.println(seq.size());
+    
+    // Log first few steps for debugging
+    for (size_t i = 0; i < seq.size() && i < 3; i++) {
+      Serial.print("  Step ");
+      Serial.print(i);
+      Serial.print(": mode=");
+      Serial.print(seq[i].mode);
+      Serial.print(", duration=");
+      Serial.print(seq[i].duration);
+      Serial.println("ms");
+    }
+    
     lastJs = CFG.customSeq;
-    idx = 0; stepStart = millis();
+    idx = 0; 
+    stepStart = millis();
   }
 
   if (seq.empty()) {
@@ -743,37 +1105,165 @@ static void animCustom() {
   // Apply per-step parameter overrides when entering a step
   static size_t lastIdx = (size_t)-1;
   if (idx != lastIdx) {
+    Serial.print("\n=== Entering step ");
+    Serial.print(idx);
+    Serial.print(" (mode ");
+    Serial.print(s.mode);
+    Serial.println(") ===");
+    
+    // IMPORTANT: Save current mode before applying overrides
+    uint8_t savedMode = CFG.mode;
+    
     applyStepOverrides(s);
+    
+    // CRITICAL: Restore mode to MODE_CUSTOM to prevent mode confusion
+    CFG.mode = savedMode;
+    
     lastIdx = idx;
   }
 
-  // Run selected base mode with current CFG (overrides applied)
-  switch (s.mode) {
-    case MODE_SOLID:         animSolid();         break;
-    case MODE_BREATHE:       animBreathe();       break;
-    case MODE_COLOR_WIPE:    animColorWipe();     break;
-    case MODE_LARSON:        animLarson();        break;
-    case MODE_RAINBOW:       animRainbow();       break;
-    case MODE_THEATER:       animTheater();       break;
-    case MODE_TWINKLE:       animTwinkle();       break;
-    case MODE_COMET:         animComet();         break;
-    case MODE_METEOR:        animMeteor();        break;
-    case MODE_CLOCK_SPIN:    animClockSpin();     break;
-    case MODE_PLASMA:        animPlasma();        break;
-    case MODE_FIRE:          animFire();          break;
-    case MODE_PALETTE_CYCLE: animPaletteCycle();  break;
-    case MODE_PALETTE_CHASE: animPaletteChase();  break;
-    default:                 animSolid();         break;
+  // Ensure we don't call ourselves recursively
+  if (s.mode == MODE_CUSTOM) {
+    Serial.println("WARNING: Step trying to use MODE_CUSTOM, using SOLID instead");
+    animSolid();
+  } else {
+    // Run selected base mode with current CFG (overrides applied)
+    switch (s.mode) {
+      case MODE_SOLID:         animSolid();         break;
+      case MODE_BREATHE:       animBreathe();       break;
+      case MODE_COLOR_WIPE:    animColorWipe();     break;
+      case MODE_LARSON:        animLarson();        break;
+      case MODE_RAINBOW:       animRainbow();       break;
+      case MODE_THEATER:       animTheater();       break;
+      case MODE_TWINKLE:       animTwinkle();       break;
+      case MODE_COMET:         animComet();         break;
+      case MODE_METEOR:        animMeteor();        break;
+      case MODE_CLOCK_SPIN:    animClockSpin();     break;
+      case MODE_PLASMA:        animPlasma();        break;
+      case MODE_FIRE:          animFire();          break;
+      case MODE_PALETTE_CYCLE: animPaletteCycle();  break;
+      case MODE_PALETTE_CHASE: animPaletteChase();  break;
+      case MODE_UNSC_COVENANT: animUNSCCovenant();  break;
+      default:                 
+        Serial.print("WARNING: Unknown mode ");
+        Serial.println(s.mode);
+        animSolid();         
+        break;
+    }
   }
 
   // Step advance
   if (now - stepStart >= s.duration) {
+    Serial.print("Step ");
+    Serial.print(idx);
+    Serial.print(" complete after ");
+    Serial.print(now - stepStart);
+    Serial.println("ms");
+    
     stepStart = now;
     idx++;
+    
     if (idx >= seq.size()) {
-      idx = CFG.customLoop ? 0 : (seq.size()-1);
+      if (CFG.customLoop) {
+        Serial.println("Looping back to step 0");
+        idx = 0;
+      } else {
+        Serial.println("Sequence complete, staying on last step");
+        idx = seq.size() - 1;
+      }
     }
   }
+}
+
+// Also update parseCustomSteps with better error reporting
+static bool parseCustomSteps(const String& js, std::vector<CustomStep>& out) {
+  out.clear();
+  
+  if (!js.length() || js == "[]") {
+    Serial.println("parseCustomSteps: Empty or [] JSON");
+    return true;
+  }
+  
+  StaticJsonDocument<2048> doc;
+  DeserializationError err = deserializeJson(doc, js);
+  
+  if (err) {
+    Serial.print("parseCustomSteps: JSON deserialization error: ");
+    Serial.println(err.c_str());
+    Serial.print("JSON string was: ");
+    Serial.println(js);
+    return false;
+  }
+  
+  if (!doc.is<JsonArray>()) {
+    Serial.println("parseCustomSteps: JSON is not an array");
+    return false;
+  }
+  
+  JsonArray arr = doc.as<JsonArray>();
+  Serial.print("parseCustomSteps: Array has ");
+  Serial.print(arr.size());
+  Serial.println(" elements");
+  
+  for (JsonVariant v : arr) {
+    if (!v.is<JsonObject>()) {
+      Serial.println("parseCustomSteps: Skipping non-object element");
+      continue;
+    }
+    
+    JsonObject o = v.as<JsonObject>();
+    CustomStep s;
+    
+    // Parse with validation
+    s.mode = (uint8_t)(o.containsKey("mode") ? o["mode"].as<int>() : MODE_SOLID);
+    if (s.mode >= MODE_COUNT) {
+      Serial.print("parseCustomSteps: Invalid mode ");
+      Serial.print(s.mode);
+      Serial.println(", using SOLID");
+      s.mode = MODE_SOLID;
+    }
+    
+    int dur = o.containsKey("duration") ? o["duration"].as<int>() : 1000;
+    if (dur < 1) dur = 1; 
+    if (dur > 60000) dur = 60000;
+    s.duration = (uint16_t)dur;
+    
+    // Optional overrides
+    if (o.containsKey("speed"))       { s.hasSpeed = true;     s.speed = o["speed"].as<uint8_t>(); }
+    if (o.containsKey("intensity"))   { s.hasIntensity = true; s.intensity = o["intensity"].as<uint8_t>(); }
+    if (o.containsKey("width"))       { 
+      s.hasWidth = true;     
+      int w = o["width"].as<int>(); 
+      if (w < 1) w = 1; 
+      if (w > 255) w = 255; 
+      s.width = (uint8_t)w; 
+    }
+    if (o.containsKey("paletteCount")){ 
+      s.hasPCnt = true;      
+      uint8_t pc = o["paletteCount"].as<uint8_t>(); 
+      s.pcount = (pc < 1) ? 1 : ((pc > 4) ? 4 : pc); 
+    }
+    if (o.containsKey("colorA")) { s.hasA = true; s.colorA = o["colorA"].as<uint32_t>(); }
+    if (o.containsKey("colorB")) { s.hasB = true; s.colorB = o["colorB"].as<uint32_t>(); }
+    if (o.containsKey("colorC")) { s.hasC = true; s.colorC = o["colorC"].as<uint32_t>(); }
+    if (o.containsKey("colorD")) { s.hasD = true; s.colorD = o["colorD"].as<uint32_t>(); }
+    
+    out.push_back(s);
+  }
+  
+  Serial.print("parseCustomSteps: Successfully parsed ");
+  Serial.print(out.size());
+  Serial.println(" steps");
+  
+  return true;
+}
+
+// Reset static state when leaving custom mode
+static void resetCustomState() {
+  Serial.println("Resetting custom mode state");
+  // Force re-parse on next entry by clearing lastJs
+  // This is a workaround - in production, make these class members instead
+  // Note: Cannot reset lastJs from outside animCustom without refactoring
 }
 
 // -------------------- Frame selection --------------------
@@ -785,7 +1275,47 @@ static void renderFrame() {
     return;
   }
 
-  switch (CFG.mode) {
+  
+
+  // --- Kratos passthrough (GPIO 11) ---
+  if (CFG.kratosMode) {
+    if (!kratosInited) {
+      pinMode(KRATOS_GPIO, INPUT);
+      // Only start RMT if we successfully initialize
+      if (!g_kratos_ready) {
+        rmtStart();
+        if (!g_kratos_ready) {
+          Serial.println("Kratos RMT failed to start - disabling");
+          CFG.kratosMode = false; // Auto-disable on failure
+          fillRing(RgbColor(0,0,0));
+          showRing();
+          return;
+        }
+      }
+      kratosInited = true;
+    }
+  
+    // Only poll if RMT is actually ready
+    if (g_kratos_ready) {
+      kratosPollRmt();
+    }
+  
+    if ((millis() - g_kr_lastMs) > KRATOS_STALE_MS) {
+      if (!g_kr_blankSent) {
+        fillRing(RgbColor(0,0,0));
+        showRing();
+        #ifdef ROL_H
+          ROL::kratosFeed(nullptr, 0);
+        #endif
+        g_kr_blankSent = 1;
+      }
+    } else {
+      g_kr_blankSent = 0;
+    }
+    return;
+  }
+
+switch (CFG.mode) {
     case MODE_SOLID:         animSolid();         break;
     case MODE_BREATHE:       animBreathe();       break;
     case MODE_COLOR_WIPE:    animColorWipe();     break;
@@ -802,8 +1332,12 @@ static void renderFrame() {
     case MODE_PALETTE_CYCLE: animPaletteCycle();  break;
     case MODE_PALETTE_CHASE: animPaletteChase();  break;
 
+
+
     // NEW: Custom playlist
     case MODE_CUSTOM:        animCustom();        break;
+
+    case MODE_UNSC_COVENANT:  animUNSCCovenant();  break;
 
     default: break;
   }
@@ -841,6 +1375,7 @@ static String configToJson() {
 
   // NEW fields
   doc["masterOff"]   = CFG.masterOff;
+  doc["kratosMode"] = CFG.kratosMode;
   doc["customSeq"]   = CFG.customSeq;
   doc["customLoop"]  = CFG.customLoop;
 
@@ -906,6 +1441,7 @@ static bool parseConfig(const String& body, AppConfig& out) {
   if (doc.containsKey("masterOff"))   out.masterOff = doc["masterOff"].as<bool>();
   if (doc.containsKey("customLoop"))  out.customLoop= doc["customLoop"].as<bool>();
   if (doc.containsKey("customSeq"))   out.customSeq = doc["customSeq"].as<const char*>();
+  if (doc.containsKey("kratosMode")) out.kratosMode = doc["kratosMode"].as<bool>();
 
   return true;
 }
@@ -969,6 +1505,7 @@ static void loadConfig() {
     if (doc.containsKey("masterOff"))   tmp.masterOff = doc["masterOff"].as<bool>();
     if (doc.containsKey("customLoop"))  tmp.customLoop= doc["customLoop"].as<bool>();
     if (doc.containsKey("customSeq"))   tmp.customSeq = doc["customSeq"].as<const char*>();
+    if (doc.containsKey("kratosMode"))  tmp.kratosMode = doc["kratosMode"].as<bool>();
 
     CFG = tmp;
   }
@@ -1069,6 +1606,7 @@ code{background:#0b1220;border:1px solid #273657;border-radius:6px;padding:2px 6
         <option value="12">Palette Cycle</option>
         <option value="13">Palette Chase</option>
         <option value="14">Custom (Playlist)</option>
+        <option value="15">USNC <-> Covenant</option>
       </select>
     </div>
     <div class="md-4"><label>Brightness</label><input id="brightness" type="range" min="1" max="255"></div>
@@ -1117,37 +1655,36 @@ code{background:#0b1220;border:1px solid #273657;border-radius:6px;padding:2px 6
       </fieldset>
     </div>
 
-    <!-- NEW: Custom Playlist Editor -->
-    <div class="md-12 opt opt-custom hide">
+    <!-- Kratos Passthrough -->
+    <div class="md-12">
       <fieldset>
-        <legend>Custom Playlist</legend>
-        <div class="inline" style="align-items:center">
-          <label><input id="customLoop" type="checkbox" checked> Loop playlist</label>
+        <legend>External Control</legend>
+        <div class="inline">
+          <label><input id="kratosMode" type="checkbox"> Kratos Passthrough Mode (GPIO 11)</label>
         </div>
-        <label>Steps (JSON array)</label>
-        <textarea id="customSeq" rows="8"></textarea>
-        <div class="hint">
-          Build from existing modes for stability. Example:
-          <code>[{"mode":0,"duration":1000,"colorA":16711680},{"mode":7,"duration":1200,"speed":200,"width":6},{"mode":12,"duration":1500,"paletteCount":3}]</code>
-        </div>
+        <div class="hint">Enable to receive WS2812 data from external source on GPIO 11</div>
       </fieldset>
     </div>
 
-    <!-- NEW: Custom Playlist Editor (Visual) -->
+    <!-- Replace the duplicate Custom Playlist sections with this single, corrected version -->
+
+    <!-- Custom Playlist Editor (Visual) -->
     <div class="md-12 opt opt-custom hide">
       <fieldset>
-        <legend>Custom Playlist</legend>
+        <legend>Custom Playlist Editor</legend>
         <div class="inline" style="align-items:center">
           <label><input id="customLoop" type="checkbox" checked> Loop playlist</label>
           <button id="addStep" type="button" class="btn-xs">Add Step</button>
           <button id="clearSteps" type="button" class="btn-xs">Clear</button>
-          <span class="muted">Drag not required: use Up/Down per step</span>
+          <button id="importJson" type="button" class="btn-xs">Import JSON</button>
+          <button id="exportJson" type="button" class="btn-xs">Export JSON</button>
         </div>
         <div id="plist" class="plist"></div>
-        <!-- Keep a hidden field with JSON for firmware compatibility -->
-        <textarea id="customSeq" class="hide" rows="1"></textarea>
+        <!-- Hidden field for firmware compatibility -->
+        <textarea id="customSeq" class="hide" rows="1">[]</textarea>
         <div class="hint">
-          The editor builds the playlist for you. Each step plays one built-in mode for a duration.
+          Build your playlist visually. Each step plays a built-in mode for a set duration.
+          Import/Export JSON for advanced editing or backup.
         </div>
       </fieldset>
     </div>
@@ -1248,6 +1785,7 @@ function fillForm(s){
 
   // NEW
   el('masterOff').checked = !!s.masterOff;
+  el('kratosMode').checked = !!s.kratosMode;
   el('customLoop').checked = !!s.customLoop;
   el('customSeq').value = (s.customSeq && String(s.customSeq).length) ? s.customSeq : "[]";
 
@@ -1291,6 +1829,7 @@ function gather(){
 
     // NEW
     masterOff: el('masterOff').checked,
+    kratosMode: el('kratosMode').checked,
     customLoop: el('customLoop').checked,
     customSeq: (el('customSeq').value || "[]"), // kept in sync by the visual editor
   };
@@ -1351,7 +1890,7 @@ bind('paletteCount', () => {
 // Live preview for the rest
 ['brightness','speed','intensity','width','colorA','colorB','colorC','colorD','resume','smbusCpu','smbusFan',
  'rev0','rev1','rev2','rev3','c0','c1','c2','c3',
- 'masterOff','customLoop']
+ 'masterOff','customLoop','kratosMode']
   .forEach(id => bind(id, preview));
 
 // ------------ Custom Playlist UI (visual builder) ------------
@@ -1566,6 +2105,9 @@ void begin(const RGBCtrlPins& pins) {
 
   // Render once; showRing() will apply the fade ramp
   renderFrame();
+  pinMode(KRATOS_GPIO, INPUT);
+  if (!g_kratos_ready) rmtStart();
+  kratosInited = true;
 }
 
 void attachWeb(AsyncWebServer& server, const char* basePath) {

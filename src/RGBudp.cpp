@@ -123,7 +123,7 @@ static void replyErr(IPAddress ip, uint16_t port, const char* op, const char* er
 static String buildDiscoverJson() {
   // Keep "ver" for compatibility; consumers can ignore it.
   String out = String("{\"ok\":true,\"op\":\"discover\",\"name\":\"XBOX RGB\",")
-             + "\"ver\":\"1.4.x\",\"port\":" + String(gPort)
+             + "\"ver\":\"1.8.x\",\"port\":" + String(gPort)
              + ",\"ip\":\"" + WiFi.localIP().toString() + "\""
              + ",\"mac\":\"" + macStr() + "\"}";
   return out;

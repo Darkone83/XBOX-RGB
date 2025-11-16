@@ -4,6 +4,7 @@
 #include "RGBsmbus.h"
 #include "RGBudp.h"
 #include "rol.h"
+#include "RGBble.h"
 #include  <ESPmDNS.h>
 
 extern AsyncWebServer server;
@@ -12,6 +13,7 @@ void setup() {
   Serial.begin(115200);
   LedStat::begin();
   WiFiMgr::begin();
+  RGBble::begin();
   RGBCtrl::begin({ /*ch1=*/2, /*ch2=*/3, /*ch3=*/4, /*ch4=*/5 });
   RGBCtrl::attachWeb("/config");
   RGBsmbus::begin({
@@ -28,6 +30,7 @@ void setup() {
 void loop() {
   LedStat::loop();
   WiFiMgr::loop();
+  RGBble::loop();
   RGBCtrl::loop();
   RGBsmbus::loop();
   ROL::loop();

@@ -3,11 +3,13 @@
 #include "RGBCtrl.h"
 #include "RGBsmbus.h"
 #include "RGBudp.h"
+#include "rol.h"
 #include  <ESPmDNS.h>
 
 extern AsyncWebServer server;
 
 void setup() {
+  Serial.begin(115200);
   LedStat::begin();
   WiFiMgr::begin();
   RGBCtrl::begin({ /*ch1=*/2, /*ch2=*/3, /*ch3=*/4, /*ch4=*/5 });
@@ -18,6 +20,7 @@ void setup() {
     /*sda=*/8,    // XSDA
     /*scl=*/9     // XSCL
   }, 10, 10);
+  ROL::begin(10, 18);
   RGBCtrlUDP::begin(7777 /*port*/, nullptr /*or "my_psk"*/);
 }
 
@@ -27,6 +30,7 @@ void loop() {
   WiFiMgr::loop();
   RGBCtrl::loop();
   RGBsmbus::loop();
+  ROL::loop();
   RGBCtrlUDP::loop();
 
   static bool mdnsStarted = false;

@@ -14,7 +14,7 @@ namespace WiFiMgr { AsyncWebServer& getServer(); }
 
 
 // -------------------- Build / Branding --------------------
-static const char* APP_VERSION = "1.7.2 Halo"; // shown in footer
+static const char* APP_VERSION = "1.8.0 BLE Edition"; // shown in footer
 static const char* COPYRIGHT_TXT = "© Darkone Customs 2025";
 
 // -------------------- Limits / Types --------------------
@@ -1350,6 +1350,9 @@ static const char* NVS_KEY= "config";
 
 static void defaults() { CFG = AppConfig(); }
 
+// PATCH FOR RGBCtrl.cpp
+// Replace the configToJson() function (around line 1353) with this version:
+
 static String configToJson() {
   StaticJsonDocument<2048> doc;
   JsonArray counts = doc.createNestedArray("count");
@@ -1367,7 +1370,8 @@ static String configToJson() {
   doc["resumeOnBoot"] = CFG.resumeOnBoot;
   doc["enableCpu"]    = CFG.enableCpu;
   doc["enableFan"]    = CFG.enableFan;
-  doc["inPreview"]    = inPreview;
+  // DO NOT include inPreview for BLE - it causes serialization issues
+  // doc["inPreview"]    = inPreview;
 
   // per-channel reverse
   JsonArray rev = doc.createNestedArray("reverse");
@@ -1376,7 +1380,19 @@ static String configToJson() {
   // NEW fields
   doc["masterOff"]   = CFG.masterOff;
   doc["kratosMode"] = CFG.kratosMode;
-  doc["customSeq"]   = CFG.customSeq;
+  
+  // Parse customSeq as JSON and insert it properly (avoid double-escaping)
+  // customSeq is a String containing JSON like "[]" or "[{...}]"
+  StaticJsonDocument<512> seqDoc;
+  DeserializationError err = deserializeJson(seqDoc, CFG.customSeq);
+  if (!err) {
+    // Successfully parsed - copy the array
+    doc["customSeq"] = seqDoc.as<JsonArray>();
+  } else {
+    // Failed to parse - use empty array as fallback
+    doc["customSeq"] = doc.createNestedArray();
+  }
+  
   doc["customLoop"]  = CFG.customLoop;
 
   // Non-persistent display info

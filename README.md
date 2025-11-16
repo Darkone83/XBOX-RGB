@@ -41,6 +41,7 @@ The web UI previews changes live and saves them to flash (NVS).
   - **CPU temperature** bar (green→yellow→red, max 75 °C)
   - **Fan percentage** bar (blue→yellow→orange)
 - 🛜 **UDP control** UDP comminucation and control for XBMC4Gamers and the PC app
+- 🛜 **BLE control** BLE support for configuration and control (experemental).
 
 ---
 
@@ -164,4 +165,4 @@ Open **`/ota`**, pick your compiled `.bin`, upload, wait for reboot.
 - **Board:** `ESP32S3 Dev Module` (or your S3 variant)  
 - **USB CDC On Boot:** Enabled  
 - **PSRAM:** Optional  
-- **Partition Scheme:** Default (4 MB with spiffs is fine)
+- **Partition Scheme:** Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)
