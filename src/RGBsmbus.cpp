@@ -130,6 +130,10 @@ static const uint8_t I2C_XCALIBUR  = 0x70;
 #ifndef RGBSMBUS_MIN_QUIET_MS
 #define RGBSMBUS_MIN_QUIET_MS 6
 #endif
+// Sticky clear threshold: you can clear sticky guard only if no beacons for this long
+#ifndef RGBSMBUS_STICKY_CLEAR_MS
+#define RGBSMBUS_STICKY_CLEAR_MS 60000UL
+#endif
 // ===============================================================
 
 namespace RGBsmbus {
@@ -165,6 +169,12 @@ static WiFiUDP guardUdp;
 static const uint16_t TYPE_D_PORT = 50502;            // beacons arrive here
 static unsigned long lastTypeDSeen = 0;
 
+// HARD / STICKY guard latch: once set by Type-D presence, it stays set until manual clear.
+static volatile bool gGuardSticky = false;
+
+// Wire (I2C) init gating: we only init when not guarded
+static bool gWireReady = false;
+
 static inline unsigned long jitter_ms(unsigned long maxJ) {
   return (millis() ^ 0xA5A5u) % (maxJ + 1);
 }
@@ -173,20 +183,32 @@ static void armNextPoll(uint32_t base_ms = RGBSMBUS_POLL_MS) {
   nextPoll = millis() + base_ms + jitter_ms(RGBSMBUS_JITTER_MAX_MS);
 }
 
+static void markTypeDSeen() {
+  lastTypeDSeen = millis();
+  gGuardSticky = true; // STICKY latch
+}
+
 static void pollTypeD() {
   int len = guardUdp.parsePacket();
   while (len > 0) {
     char msg[64];
     int r = guardUdp.read((uint8_t*)msg, (len < 63 ? len : 63));
     msg[r > 0 ? r : 0] = '\0';
+    // Expected broadcast payload: "TYPE_D_ID:6"
     if (strstr(msg, "TYPE_D_ID:6")) {
-      lastTypeDSeen = millis();
+      markTypeDSeen();
     }
     len = guardUdp.parsePacket();
   }
 }
-static inline bool typeDPresent() {
+
+static inline bool typeDPresentWindow() {
   return (millis() - lastTypeDSeen) < RGBSMBUS_TYPE_D_TTL_MS;
+}
+
+// HARD guard predicate: sticky OR presently within TTL window
+static inline bool smbusGuardedHard() {
+  return gGuardSticky || typeDPresentWindow();
 }
 
 // ---------- helpers ----------
@@ -250,7 +272,37 @@ static void drawBar(Adafruit_NeoPixel& strip,
   strip.show();
 }
 
-// ---------- SMBus safety helpers ----------
+// ---------- SMBus / Wire helpers ----------
+static bool gPinsInput = true;
+
+static void wirePinsToInput() {
+  pinMode(PINS.sda, INPUT);
+  pinMode(PINS.scl, INPUT);
+  gPinsInput = true;
+}
+
+static void ensureWireReady() {
+  if (gWireReady || smbusGuardedHard()) return; // don't init while guarded
+  // IMPORTANT: no internal pull-ups; Xbox SMBus has its own
+  wirePinsToInput(); // set as inputs first (documented behavior)
+  Wire.begin(PINS.sda, PINS.scl);
+  Wire.setClock(RGBSMBUS_I2C_HZ);
+#if defined(ARDUINO_ARCH_ESP32)
+  Wire.setTimeOut(20); // keep stalls short to avoid UI hiccups
+#endif
+  gWireReady = true;
+  gPinsInput = false;
+}
+
+static void dropWireIfGuarded() {
+  if (!smbusGuardedHard()) return;
+  // We cannot fully "end" Wire on ESP32 Arduino, but we can stop touching it and float the pins.
+  if (!gPinsInput) {
+    wirePinsToInput();
+  }
+  gWireReady = false;
+}
+
 static bool waitBusIdle(uint8_t sda, uint8_t scl,
                         uint32_t timeout_ms = RGBSMBUS_WAIT_IDLE_MS,
                         int stable_needed = RGBSMBUS_IDLE_STABLE) {
@@ -285,17 +337,18 @@ static void smbusBreather() {
 static uint8_t s_stuckPolls = 0;
 static void maybeRecoverWire() {
   if (++s_stuckPolls >= RGBSMBUS_STUCK_POLL_THRESHOLD) {
-    Wire.begin(PINS.sda, PINS.scl);
-    Wire.setClock(RGBSMBUS_I2C_HZ);
-#if defined(ARDUINO_ARCH_ESP32)
-    Wire.setTimeOut(20);
-#endif
+    gWireReady = false; // force re-init on next allowed cycle
     s_stuckPolls = 0;
   }
 }
 
 // ---------- STOP-only single byte read (1.6-safe) ----------
 static bool readByteSTOP(uint8_t addr7, uint8_t reg, uint8_t& value) {
+  if (smbusGuardedHard()) return false;
+
+  ensureWireReady();
+  if (!gWireReady) return false;
+
   RGBCtrlUDP::enterSmbusQuietUs(RGBSMBUS_GUARD_PER_ATTEMPT_US);
   if (!waitBusIdle(PINS.sda, PINS.scl)) return false;
   if (!quietSinceLastPollerTouch())     return false;
@@ -324,7 +377,12 @@ static bool readByteSTOP(uint8_t addr7, uint8_t reg, uint8_t& value) {
 
 // ---------- RS+read (only if allowed & not 1.6) ----------
 static bool readByteRS(uint8_t addr7, uint8_t reg, uint8_t& value) {
+  if (smbusGuardedHard()) return false;
   if (gIsXcalibur || !RGBSMBUS_ALLOW_RS) return false;
+
+  ensureWireReady();
+  if (!gWireReady) return false;
+
   RGBCtrlUDP::enterSmbusQuietUs(RGBSMBUS_GUARD_PER_ATTEMPT_US);
   if (!waitBusIdle(PINS.sda, PINS.scl)) return false;
   if (!quietSinceLastPollerTouch())     return false;
@@ -406,8 +464,10 @@ static bool probeI2C(uint8_t addr7) {
 
 static void detectBoardLazy() {
   if (gBoardDetected) return;
-  if (typeDPresent()) return;               // never probe while Type-D is around
+  if (smbusGuardedHard()) return;          // NEVER probe while guarded
   RGBCtrlUDP::enterSmbusQuietUs(2000);
+  ensureWireReady();
+  if (!gWireReady) return;
   if (!waitBusIdle(PINS.sda, PINS.scl)) return;
   if (!quietSinceLastPollerTouch())     return;
   gIsXcalibur = probeI2C(I2C_XCALIBUR);
@@ -441,15 +501,9 @@ void begin(const RGBsmbusPins& pins, uint8_t ch5Count, uint8_t ch6Count) {
   lastAppliedBrightnessCpu = BRIGHTNESS;
   lastAppliedBrightnessFan = BRIGHTNESS;
 
-  // IMPORTANT: no internal pull-ups; Xbox SMBus has its own
-  pinMode(PINS.sda, INPUT);
-  pinMode(PINS.scl, INPUT);
-
-  Wire.begin(PINS.sda, PINS.scl);
-  Wire.setClock(RGBSMBUS_I2C_HZ);
-#if defined(ARDUINO_ARCH_ESP32)
-  Wire.setTimeOut(20); // keep stalls short to avoid UI hiccups
-#endif
+  // Start with pins floated; Wire will init only when unguarded
+  wirePinsToInput();
+  gWireReady = false;
 
   smoothedCpu = 0.f; smoothedFan = 0.f;
   applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
@@ -465,8 +519,9 @@ static void updateOnceRR() {
   // Mirror UI flags each cycle
   applyEnableFlags(RGBCtrl::smbusCpuEnabled(), RGBCtrl::smbusFanEnabled());
 
-  // If Type-D present → never touch SMBus; blanks to indicate guard
-  if (typeDPresent()) {
+  // HARD guard path: blank bars, keep Wire down
+  if (smbusGuardedHard()) {
+    dropWireIfGuarded();
     if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
     if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
@@ -485,10 +540,16 @@ static void updateOnceRR() {
   // Coarse quiet window for the whole RR step
   RGBCtrlUDP::enterSmbusQuietUs(RGBSMBUS_GUARD_PER_POLL_US);
 
+  ensureWireReady();
+  if (!gWireReady) {
+    if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
+    if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
+    return;
+  }
+
   // Require idle lines AND spacing since last SMBus activity
   if (!waitBusIdle(PINS.sda, PINS.scl) || !quietSinceLastPollerTouch()) {
     maybeRecoverWire();
-    // show blanks to indicate skip
     if (CH5_COUNT) drawBar(cpuStrip, lastAppliedBrightnessCpu, CH5_COUNT, 0, 0);
     if (CH6_COUNT) drawBar(fanStrip, lastAppliedBrightnessFan, CH6_COUNT, 0, 0);
     return;
@@ -545,7 +606,11 @@ static void updateOnceRR() {
 }
 
 void loop() {
+  // Always keep guard presence fresh
   pollTypeD();
+
+  // If a guard has (re)latched, ensure Wire stays down
+  if (smbusGuardedHard()) dropWireIfGuarded();
 
   const uint32_t now = millis();
   if (now >= nextPoll) {
@@ -565,37 +630,70 @@ bool fanEnabled() { return gEnableFAN; }
 
 bool isXcalibur() { return gIsXcalibur; }
 
-// Optional: tiny REST API. (Kept as-is; attach from your Web setup if desired.)
+// Tiny REST API, including HARD guard inspection/clear
 void attachWeb(AsyncWebServer& server, const char* basePath) {
   String base = (basePath && *basePath) ? basePath : "/config/smbus";
-  String api  = base + "/api/flags";
+  String apiFlags  = base + "/api/flags";
+  String apiGuard  = base + "/api/guard";
 
-  server.on(api.c_str(), HTTP_GET, [](AsyncWebServerRequest* r){
+  server.on(apiFlags.c_str(), HTTP_GET, [](AsyncWebServerRequest* r){
     bool cpuSaved = RGBCtrl::smbusCpuEnabled();
     bool fanSaved = RGBCtrl::smbusFanEnabled();
-    bool guarded  = typeDPresent();
+    bool guarded  = smbusGuardedHard();
 
     bool cpuEff = guarded ? false : cpuSaved;
     bool fanEff = guarded ? false : fanSaved;
 
     auto* s = r->beginResponseStream("application/json");
     s->printf("{\"cpu\":%s,\"fan\":%s,\"savedCpu\":%s,\"savedFan\":%s,"
-              "\"guarded\":%s,\"guardReason\":\"%s\",\"xcalibur\":%s}",
+              "\"guarded\":%s,\"guardReason\":\"%s\",\"sticky\":%s,\"xcalibur\":%s}",
               cpuEff?"true":"false",
               fanEff?"true":"false",
               cpuSaved?"true":"false",
               fanSaved?"true":"false",
               guarded?"true":"false",
-              guarded?"TypeD":"none",
+              (gGuardSticky||typeDPresentWindow())?"TypeD":"none",
+              gGuardSticky?"true":"false",
               gIsXcalibur?"true":"false");
     r->send(s);
   });
 
-  server.on(api.c_str(), HTTP_POST, [](AsyncWebServerRequest* r){
+  // POST body example: {"clear":true}
+  server.on(apiGuard.c_str(), HTTP_POST, [](AsyncWebServerRequest* r){
+    r->send(405, "text/plain", "POST with body only");
+  }, nullptr, [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t){
+    String body((const char*)data, len);
+    body.replace(" ", ""); body.replace("\n", ""); body.replace("\r", "");
+    bool wantClear = body.indexOf("\"clear\":true") >= 0;
+
+    bool ok=false, cleared=false;
+    if (wantClear) {
+      // Only allow clearing sticky if Type-D hasn't been seen recently
+      unsigned long idle = millis() - lastTypeDSeen;
+      if (idle >= RGBSMBUS_STICKY_CLEAR_MS) {
+        gGuardSticky = false;
+        ok = true; cleared = true;
+      } else {
+        ok = false; cleared = false;
+      }
+    }
+
+    auto* s = req->beginResponseStream("application/json");
+    s->printf("{\"ok\":%s,\"cleared\":%s,\"guarded\":%s,\"sticky\":%s,\"lastSeenMsAgo\":%lu}",
+              ok?"true":"false",
+              cleared?"true":"false",
+              smbusGuardedHard()?"true":"false",
+              gGuardSticky?"true":"false",
+              (unsigned long)(millis() - lastTypeDSeen));
+    req->send(s);
+  });
+
+  server.on(apiFlags.c_str(), HTTP_POST, [](AsyncWebServerRequest* r){
     r->send(405, "text/plain", "POST with body only");
   },
   nullptr,
   [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t){
+    // Allow toggling local bars, but guard still applies.
     bool ok = true;
     String body((const char*)data, len);
     body.replace(" ", ""); body.replace("\n", ""); body.replace("\r", "");
@@ -616,17 +714,18 @@ void attachWeb(AsyncWebServer& server, const char* basePath) {
     }
     applyEnableFlags(cpu, fan);
 
-    bool guarded  = typeDPresent();
+    bool guarded  = smbusGuardedHard();
     bool cpuEff = guarded ? false : gEnableCPU;
     bool fanEff = guarded ? false : gEnableFAN;
 
     auto* s = req->beginResponseStream("application/json");
-    s->printf("{\"ok\":%s,\"cpu\":%s,\"fan\":%s,\"guarded\":%s,\"guardReason\":\"%s\",\"xcalibur\":%s}",
+    s->printf("{\"ok\":%s,\"cpu\":%s,\"fan\":%s,\"guarded\":%s,\"guardReason\":\"%s\",\"sticky\":%s,\"xcalibur\":%s}",
               ok?"true":"false",
               cpuEff?"true":"false",
               fanEff?"true":"false",
               guarded?"true":"false",
-              guarded?"TypeD":"none",
+              (gGuardSticky||typeDPresentWindow())?"TypeD":"none",
+              gGuardSticky?"true":"false",
               gIsXcalibur?"true":"false");
     req->send(s);
   });

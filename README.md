@@ -8,6 +8,7 @@
   <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Front.png" width=400><img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Back.png" width=400>
 </div>
 
+<a href="https://discord.gg/k2BQhSJ"><img src="https://github.com/Darkone83/ModXo-Basic/blob/main/Images/discord.svg"></a>
 
 A custom RGB controller that drives up to **6 WS2812/NeoPixel channels** for original Xbox RGB lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
 
@@ -132,6 +133,8 @@ Open **`/ota`**, pick your compiled `.bin`, upload, wait for reboot.
 ---
 
 ## Building / Compiling
+
+#### Web Flasher: [![XBOX=RGB Web Flasher](https://img.shields.io/badge/Web%20Flasher-XBOX%E2%80%93RGB-green?logo=esp32&logoColor=white)](https://darkone83.github.io/xbox-rgb.github.io/)
 
 ### Prerequisites
 
