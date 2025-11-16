@@ -118,6 +118,8 @@ Ch4 - 8:
 
 <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/CH4-6.png">
 
+<img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/CH7-8.png">
+
 XSMB:
 
 <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/XSMB.png">
