@@ -2,10 +2,6 @@
 #include <Arduino.h>
 #include <ESPAsyncWebServer.h>
 
-namespace WiFiMgr {
-  AsyncWebServer& getServer();
-}
-
 // ---- Public API -------------------------------------------------------------
 struct RGBCtrlPins {
   uint8_t ch1, ch2, ch3, ch4; // WS2812 data pins for CH1..CH4

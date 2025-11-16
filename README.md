@@ -10,11 +10,13 @@
 
 <a href="https://discord.gg/k2BQhSJ"><img src="https://github.com/Darkone83/ModXo-Basic/blob/main/Images/discord.svg"></a>
 
-A custom RGB controller that drives up to **6 WS2812/NeoPixel channels** for original Xbox RGB lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**.
+A custom RGB controller that drives up to **8 WS2812/NeoPixel channels** for original Xbox RGB lighting — with a **captive-portal Wi-Fi setup**, **web control UI**, **OTA updates**, and optional **Xbox SMBus** telemetry bars for **CPU temperature (CH5)** and **fan speed (CH6)**, **Jewel ROL CH7** and **CH8 for future espansion**.
 
 - **CH1–CH4**: Main LED ring (up to **50 pixels per channel**).  
 - **CH5**: CPU temperature bar (up to **10 pixels**).  
-- **CH6**: Fan speed bar (up to **10 pixels**).  
+- **CH6**: Fan speed bar (up to **10 pixels**). 
+- **CH7**: Jewel Ring of Light (ROL) **18 pixels**.
+- **CH8**: Future Expansions. 
 
 The web UI previews changes live and saves them to flash (NVS).
 
@@ -26,7 +28,7 @@ The web UI previews changes live and saves them to flash (NVS).
 - 🔆 Global **brightness** (1–255)
 -  💡 **Power on fade in** slow but gentle boot fdade in
 - ⚙️ Per-mode controls: **Speed**, **Intensity**, **Width/Gap**, **Color A / Color B**
-- 🧭 **Sane orientation & sync**: effects start at **CH1 (Front)** and flow clockwise **CH1→CH2→CH3→CH4**; all “phase” effects are synchronized
+- 🧭 **Sane orientation & sync**: effects start at **CH1 (Front)** and flow clockwise **CH1→CH2→CH3→CH4→CH7→CH8**; all “phase” effects are synchronized
 - 🪩 **Adjustable Strip length** CH1 - 4 can support up to 50 LEDs configurable from the webui
 - 🔀 **Reversible channel support** Adjust the direction of your channels if you installed them backwards
 - 💾 **Persistent settings** in NVS (counts, mode, colors, brightness, toggles…)
@@ -56,6 +58,7 @@ The web UI previews changes live and saves them to flash (NVS).
 12. **Fire / Flicker**
 13. **Palette Cycle**
 14. **Palette Chase**
+15. **USNC <-> Covenant** **NEW**
 
 > The UI only shows controls that matter for the selected mode.  
 > Example: *Meteor* uses **Color A** and **Color B**; *Breathe* ignores **width**.
@@ -92,6 +95,9 @@ Designed around **ESP32-S3-Zero** (or similar ESP32-S3 boards).
 - **CH4** → `IO4` (Right)  
 - **CH5** → `IO5` (CPU bar)  
 - **CH6** → `IO6` (Fan bar)
+- **CH7** → `IO10` (Jewel ROL)
+- **Kratos_In** → `IO11` (Kratos Passthrough (Future Expansion))
+- **CH8** → `IO12` (Future Expansions)
 
 **SMBus (Xbox SMC I²C):**
 
@@ -108,7 +114,7 @@ CH1 - 3:
 
 <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/CH1-3.png">
 
-Ch4 - 6:
+Ch4 - 8:
 
 <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/CH4-6.png">
 
