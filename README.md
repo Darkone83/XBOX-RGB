@@ -1,5 +1,5 @@
 <div align=center>
-  <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/DC%20logo.png">
+  <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/DC%20logo.png"><img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/team-resurgent.png" height=200>
 </div>
 
 # XBOX RGB 
