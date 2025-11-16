@@ -6,6 +6,8 @@
 
 <div align=center>
   <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Front.png" width=400><img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Back.png" width=400>
+
+  <img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Jewel%20Front.png" width=400><img src="https://github.com/Darkone83/XBOX-RGB/blob/main/images/3D%20Jewel%20Back.png" width=400>
 </div>
 
 <a href="https://discord.gg/k2BQhSJ"><img src="https://github.com/Darkone83/ModXo-Basic/blob/main/Images/discord.svg"></a>
