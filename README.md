@@ -166,3 +166,13 @@ Open **`/ota`**, pick your compiled `.bin`, upload, wait for reboot.
 - **USB CDC On Boot:** Enabled  
 - **PSRAM:** Optional  
 - **Partition Scheme:** Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)
+
+
+## Credits:
+Hardware design: Darkone83
+
+Firmware: Darkone83
+
+3D Design / STLs: Mast3rmind777
+
+iOS App: Darkone83
