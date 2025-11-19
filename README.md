@@ -177,4 +177,4 @@ Firmware: Darkone83
 
 iOS App: Darkone83
 
-Androidn App: TechPhreak
+Android App: TechPhreak
