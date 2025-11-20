@@ -169,12 +169,12 @@ Open **`/ota`**, pick your compiled `.bin`, upload, wait for reboot.
 
 
 ## Credits:
-Hardware design: Darkone83
+Hardware design: darkone83
 
-Firmware: Darkone83
+Firmware: darkone83
 
-3D Design / STLs: Mast3rmind777
+3D Design / STLs: mast3rmind777
 
-iOS App: Darkone83
+iOS App: darkone83
 
-Androidn App: TechPhreak
+Android App: TechPhreak
