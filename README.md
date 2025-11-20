@@ -22,6 +22,13 @@ A custom RGB controller that drives up to **8 WS2812/NeoPixel channels** for ori
 
 The web UI previews changes live and saves them to flash (NVS).
 
+## 📱 Get the App
+
+[![Download on the App Store](https://github.com/Darkone83/XBOX-RGB/blob/main/images/download.svg)](https://apps.apple.com/us/app/dc-rgb-control/id6755371794)
+
+Download the **DC RGB Control** app for iOS to configure and manage your Darkone Customs RGB lighting hardware via BLE.
+
+
 ---
 
 ## Features
