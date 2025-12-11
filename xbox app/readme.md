@@ -247,10 +247,4 @@ Some advanced features (per-pixel mapping, complex animations, sound-reactive mo
 ## Credits
 
 - **XBOX-RGB & RXDK app** – Darkone Customs / Team Resurgent (Darkone83)  
-- Built with **RXDK** and love for the OG Xbox modding scene.
-
----
-
-## License
-
-TBD – choose the license you prefer (MIT, BSD, etc.) and update this section and/or add a `LICENSE` file to the repo.
+- Built with **RXDK** and love for the OG Xbox modding scene.\
